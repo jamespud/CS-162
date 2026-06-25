@@ -1,0 +1,14 @@
+1. Is the program’s output the same each time it is run? Why or why not?
+No, the output will not be the same each time. The order in which threads execute is non-deterministic because the operating system's CPU scheduler decides when to switch contexts between threads. In your output, the threads printed in the order: Thread 1, Thread 3, Thread 2, Thread 0. Next time, it could be 0, 1, 2, 3. Furthermore, because multiple threads are modifying the common variable concurrently (common++) without any synchronization (like a mutex), there is a data race.
+
+2. Based on the program’s output, do multiple threads share the same stack?
+No, they do not share a stack. In threadfun, tid is a local variable, meaning it is allocated on the thread's stack. If you look at your output, the memory address of tid (labeled stack:) is uniquely different for every single thread (77fa2cefae40, 77fa2bef8e40, 77fa2c6f9e40, 77fa2d6fbe40). Because local variables live at different memory addresses, each thread must have its own isolated stack space.
+
+3. Based on the program’s output, do multiple threads share the same global variables?
+Yes, they do. The address of the global variable common is exactly the same for all threads (5851d4113010). Additionally, the pointer to the heap-allocated string somethingshared also shares the exact same base address (58520a0032a0) across all threads. This demonstrates that threads share the same data segment (globals) and heap memory.
+
+4. Based on the program’s output, what is the value of void threadid? How does this relate to the variable’s type (void )?
+The value of void *threadid is 0, 1, 2, or 3 (printed as tptr in the output). This relates to its type because a void * is a generic 64-bit memory address pointer. In main, the loop variable t (which is a long) is cast directly into a void * via (void*)t when passed into pthread_create. Inside the thread, it is cast back to a long via (long)threadid. The program is intentionally "smuggling" an integer value inside a pointer to avoid having to malloc memory just to pass a simple integer thread index.
+
+5. Using the first command line argument, create a large number of threads in pthread. Do all threads run before the program exits? Why or why not?
+Yes, all successfully created threads will run. This is because the very last line of main() calls pthread_exit(NULL) instead of returning or calling exit(). When the main thread calls pthread_exit(), it terminates only the main thread. The overall process remains alive in the background until all other active peer threads have finished executing. If main() had used return 0; instead, it would have implicitly called exit(), tearing down the entire process and killing all child threads immediately, regardless of whether they had finished running.
