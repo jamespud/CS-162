@@ -1,0 +1,73 @@
+### 1. The Faulting Virtual Address
+
+**问题:** What virtual address did the program try to access from userspace that caused it to crash? Why is the program not allowed to access this memory address at this point?
+
+**答案:**
+
+* **Virtual Address:** `0xc0000008` (从第一条命令的输出 `Page fault at 0xc0000008` 中找到)。
+* **Why not allowed:** 这个地址超过了 Pintos 定义的用户栈底。在 Pintos 中，宏 `PHYS_BASE`（默认值为 `0xc0000000`）划分了用户空间（低于 `PHYS_BASE`）和内核空间（高于或等于 `PHYS_BASE`）。当程序尝试访问 `0xc0000008` 时，它试图读取属于内核保留的内存区域。由于当前运行在 Ring 3 (User Space)，没有权限访问，从而触发了保护异常（Page Fault）。
+
+### 2. The Crash Instruction Address
+
+**问题:** What is the virtual address of the instruction that resulted in the crash?
+
+**答案:**
+
+* **Crash Instruction Address (eip):** `0x8048915` (从 `grep eip` 的输出 `eip=0x8048915` 中找到)。
+
+### 3. The Function and Disassembly
+
+**问题:** What is the name of the function the program was in when it crashed? Copy the disassembled code for that function onto Gradescope, and identify the instruction at which the program crashed.
+
+**答案:**
+
+* **Function Name:** `_start`
+* **Disassembled Code:**
+```assembly
+0804890f <_start>:
+804890f:       55                      push   %ebp
+8048910:       89 e5                   mov    %esp,%ebp
+8048912:       83 ec 18                sub    $0x18,%esp
+8048915:       8b 45 0c                mov    0xc(%ebp),%eax  <-- Crash Instruction
+8048918:       89 44 24 04             mov    %eax,0x4(%esp)
+804891c:       8b 45 08                mov    0x8(%ebp),%eax
+804891f:       89 04 24                mov    %eax,(%esp)
+8048922:       e8 6d f7 ff ff          call   8048094 <main>
+8048927:       89 04 24                mov    %eax,(%esp)
+
+```
+
+
+* **Crash Instruction:** `mov 0xc(%ebp),%eax` (位于地址 `8048915`)。
+
+### 4. The C Source Code
+
+**问题:** Find the C code for the function you identified above... and copy it onto Gradescope.
+
+**答案:**
+
+```c
+void _start(int argc, char* argv[]) { exit(main(argc, argv)); }
+
+```
+
+*(`../lib/user/entry.c` 文件的第 6 行)。*
+
+### 5. Justification and High-Level Explanation
+
+**问题:** For each instruction in the disassembled function in #3, try to justify to yourself in a few words why it’s necessary... Why did the instruction you identified in #3 try to access memory at the virtual address you identified in #1?
+
+**答案:**
+
+* **Instruction Justification:**
+* `push %ebp` 和 `mov %esp,%ebp`: 设置栈帧（Stack Frame），保存旧的基址指针，并将当前栈指针设置为新的基址。
+* `sub $0x18,%esp`: 为局部变量和即将调用的函数参数分配栈空间。
+* `mov 0xc(%ebp),%eax`: **（Crash 指令）** 尝试从相对于基址指针偏移量为 `0xc` 的栈内存中读取第二个参数（即 `argv[]`）到 `%eax` 寄存器。
+* `mov %eax,0x4(%esp)`: 将刚读取的 `argv[]` 放入当前栈帧中，作为传递给 `main` 函数的参数。
+* `mov 0x8(%ebp),%eax` 和 `mov %eax,(%esp)`: 同理，读取第一个参数（`argc`）并将其推入栈顶，准备传给 `main`。
+* `call 8048094 <main>`: 调用 `main` 函数。
+
+
+* **Why it accessed `0xc0000008` (High-Level Explanation):**
+在 80x86 的 C 调用约定中，函数的参数期望被放置在调用该函数前压入的返回地址之上。在这个实验的初始状态中，操作系统（Pintos）仅将初始的栈指针 `%esp` 直接设置为了 `PHYS_BASE` (即 `0xc0000000`)，但**并没有实际完成参数传递的工作**（即把命令行参数推入栈中）。
+当 `_start` 函数执行到 `mov 0xc(%ebp),%eax` 时，因为初始的 `%esp` （此时也是 `%ebp` 的值，只不过还要减去之前的 `push` 操作等）在 `PHYS_BASE` 附近，指令尝试读取 `%ebp + 0xc` 的地址。计算下来，这就刚好指到了 `0xc0000008`，这个地址已经越过了用户态内存的边界，进入了未分配给该进程的内核内存空间。程序依然在用户态运行，无权访问内核地址，因此触发了缺页异常导致的崩溃。
