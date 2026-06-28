@@ -1,13 +1,4 @@
 #include "userprog/process.h"
-#include <debug.h>
-#include <inttypes.h>
-#include <round.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include "userprog/gdt.h"
-#include "userprog/pagedir.h"
-#include "userprog/tss.h"
 #include "filesys/directory.h"
 #include "filesys/file.h"
 #include "filesys/filesys.h"
@@ -16,15 +7,37 @@
 #include "threads/interrupt.h"
 #include "threads/malloc.h"
 #include "threads/palloc.h"
+#include "threads/pte.h"
 #include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "userprog/gdt.h"
+#include "userprog/pagedir.h"
+#include "userprog/tss.h"
+#include <debug.h>
+#include <inttypes.h>
+#include <round.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-static struct semaphore temporary;
 static thread_func start_process NO_RETURN;
 static thread_func start_pthread NO_RETURN;
 static bool load(const char* file_name, void (**eip)(void), void** esp);
 bool setup_thread(void (**eip)(void), void** esp);
+
+struct exec_args {
+  char* file_name;
+  struct child_status* my_status;
+};
+
+struct fork_args {
+  struct intr_frame parent_frame; // 复制父进程的寄存器状态（必须传值！）
+  uint32_t* child_pagedir;        // 子进程的新页目录
+  struct child_status* my_status; // 指向父进程 children 列表中的条目
+  struct fd_table* fd_table;      // 文件描述符表
+  struct file* parent_exec_file;  // 父进程的可执行文件句柄
+};
 
 /* Initializes user programs in the system by ensuring the main
    thread has a minimal PCB so that it can execute and wait for
@@ -44,6 +57,19 @@ void userprog_init(void) {
 
   /* Kill the kernel if we did not succeed */
   ASSERT(success);
+
+  t->pcb->fd_table = malloc(sizeof(struct fd_table));
+  success = t->pcb->fd_table != NULL;
+  ASSERT(success);
+
+  for (int i = 0; i < 128; i++)
+    t->pcb->fd_table->entries[i] = NULL;
+  for (int i = 0; i < 128; i++)
+    t->pcb->fd_table->inherited[i] = false;
+  t->pcb->fd_table->next_fd = 2;
+
+  list_init(&t->pcb->children);
+  t->pcb->my_status = NULL;
 }
 
 /* Starts a new thread running a user program loaded from
@@ -54,7 +80,6 @@ pid_t process_execute(const char* file_name) {
   char* fn_copy;
   tid_t tid;
 
-  sema_init(&temporary, 0);
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
   fn_copy = palloc_get_page(0);
@@ -62,17 +87,53 @@ pid_t process_execute(const char* file_name) {
     return TID_ERROR;
   strlcpy(fn_copy, file_name, PGSIZE);
 
-  /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create(file_name, PRI_DEFAULT, start_process, fn_copy);
-  if (tid == TID_ERROR)
+  struct child_status* my_status = malloc(sizeof(struct child_status));
+
+  if (my_status == NULL) {
     palloc_free_page(fn_copy);
+    return TID_ERROR;
+  }
+
+  my_status->pid = TID_ERROR;
+  my_status->is_alive = true;
+  my_status->is_waited = false;
+  my_status->exit_status = -1;
+  my_status->load_success = false;
+  sema_init(&my_status->wait_sema, 0);
+  sema_init(&my_status->load_sema, 0);
+
+  struct exec_args* args = malloc(sizeof(struct exec_args));
+  if (args == NULL) {
+    palloc_free_page(fn_copy);
+    free(my_status);
+    return TID_ERROR;
+  }
+
+  args->file_name = fn_copy;
+  args->my_status = my_status;
+
+  list_push_back(&thread_current()->pcb->children, &my_status->elem);
+
+  /* Create a new thread to execute FILE_NAME. */
+  tid = thread_create(file_name, PRI_DEFAULT, start_process, args);
+
+  if (tid == TID_ERROR) {
+    palloc_free_page(fn_copy);
+    list_remove(&my_status->elem);
+    free(my_status);
+    free(args);
+  }
+
+  my_status->pid = tid;
   return tid;
 }
 
 /* A thread function that loads a user process and starts it
    running. */
-static void start_process(void* file_name_) {
-  char* file_name = (char*)file_name_;
+static void start_process(void* args_) {
+  struct exec_args* args = (struct exec_args*)args_;
+  char* file_name = args->file_name;
+  struct child_status* my_status = args->my_status;
   struct thread* t = thread_current();
   struct intr_frame if_;
   bool success, pcb_success;
@@ -88,10 +149,42 @@ static void start_process(void* file_name_) {
     new_pcb->pagedir = NULL;
     t->pcb = new_pcb;
 
+    t->pcb->my_status = my_status;
+    list_init(&new_pcb->children);
+
     // Continue initializing the PCB as normal
     t->pcb->main_thread = t;
-    strlcpy(t->pcb->process_name, t->name, sizeof t->name);
   }
+
+  struct fd_table* fd_table = malloc(sizeof(struct fd_table));
+  if (fd_table != NULL) {
+    for (int i = 0; i < 128; i++) {
+      fd_table->entries[i] = NULL;
+      fd_table->inherited[i] = false;
+    }
+    fd_table->next_fd = 2;
+  }
+  t->pcb->fd_table = fd_table;
+
+  const char delim[] = " ";
+  char *token, *save_ptr;
+  token = strtok_r(file_name, delim, &save_ptr);
+
+  size_t argc = 1;
+  char* argv[128];
+  argv[0] = token;
+
+  while ((token = strtok_r(NULL, delim, &save_ptr)) != NULL) {
+    if (argc >= 128)
+      break; // 防御性编程：防止越界
+    argv[argc] = token;
+    argc++;
+  }
+  argv[argc] = NULL;
+
+  /* Set process name from program name (not full command line) */
+  if (success)
+    strlcpy(t->pcb->process_name, argv[0], sizeof t->pcb->process_name);
 
   /* Initialize interrupt frame and load executable. */
   if (success) {
@@ -99,7 +192,55 @@ static void start_process(void* file_name_) {
     if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
     if_.cs = SEL_UCSEG;
     if_.eflags = FLAG_IF | FLAG_MBS;
-    success = load(file_name, &if_.eip, &if_.esp);
+    success = load(argv[0], &if_.eip, &if_.esp);
+  }
+
+  t->pcb->my_status->load_success = success;
+  sema_up(&t->pcb->my_status->load_sema);
+
+  /* Keep executable write-denied for ROX protection (best-effort) */
+  if (success) {
+    struct file* exec = filesys_open(argv[0]);
+    if (exec != NULL) {
+      file_deny_write(exec);
+      t->pcb->exec_file = exec;
+    }
+  }
+
+  if (success) {
+    /* Push arguments onto the stack */
+    for (int i = argc - 1; i >= 0; i--) {
+      size_t arg_len = strlen(argv[i]) + 1;
+      if_.esp -= arg_len;
+      memcpy(if_.esp, argv[i], arg_len);
+      argv[i] = if_.esp;
+    }
+
+    /* Pad so the final %esp (after sentinel pushes) is at offset 12,
+       matching the expected alignment when _start calls main() */
+    size_t pad = ((uintptr_t)if_.esp - (argc + 4) * sizeof(uint32_t) - 12) & 0xf;
+    if_.esp -= pad;
+    memset(if_.esp, 0, pad);
+
+    if_.esp -= sizeof(char*);
+    *(char**)if_.esp = NULL;
+
+    for (int i = argc - 1; i >= 0; i--) {
+      if_.esp -= sizeof(char*);
+      *(char**)if_.esp = argv[i];
+    }
+
+    char** argv_address = if_.esp;
+    if_.esp -= sizeof(char**);
+    *(char***)if_.esp = argv_address;
+
+    if_.esp -= sizeof(int);
+    *(int*)if_.esp = argc;
+
+    if_.esp -= sizeof(void*);
+    *(void**)if_.esp = NULL;
+
+    // hex_dump((uintptr_t)if_.esp, if_.esp, PHYS_BASE - if_.esp, true);
   }
 
   /* Handle failure with succesful PCB malloc. Must free the PCB */
@@ -113,9 +254,12 @@ static void start_process(void* file_name_) {
   }
 
   /* Clean up. Exit on failure or jump to userspace */
+  free(args);
   palloc_free_page(file_name);
   if (!success) {
-    sema_up(&temporary);
+    my_status->exit_status = -1;
+    my_status->is_alive = false;
+    sema_up(&my_status->wait_sema);
     thread_exit();
   }
 
@@ -129,6 +273,165 @@ static void start_process(void* file_name_) {
   NOT_REACHED();
 }
 
+static void start_fork(void* args_);
+
+pid_t process_fork(struct intr_frame* f) {
+  struct thread* cur = thread_current();
+  uint32_t* child_pd;
+  struct child_status* my_status;
+  struct fork_args* fargs;
+  tid_t tid;
+
+  /* 1. 为子进程创建 child_status */
+  my_status = malloc(sizeof(struct child_status));
+  if (my_status == NULL)
+    return TID_ERROR;
+
+  my_status->pid = TID_ERROR;
+  my_status->is_alive = true;
+  my_status->is_waited = false;
+  my_status->exit_status = -1;
+  my_status->load_success = true; // fork 不需要 load，直接设为 true
+  sema_init(&my_status->wait_sema, 0);
+  sema_init(&my_status->load_sema, 0);
+  list_push_back(&cur->pcb->children, &my_status->elem);
+
+  /* 2. 为新进程创建页目录 */
+  child_pd = palloc_get_page(0);
+  if (child_pd == NULL) {
+    list_remove(&my_status->elem);
+    free(my_status);
+    return TID_ERROR;
+  }
+  memcpy(child_pd, init_page_dir, PGSIZE); // 复制内核映射部分
+
+  /* 3. 遍历父进程所有用户页，复制到子进程 */
+  void* upage;
+  for (upage = 0; (uintptr_t)upage < (uintptr_t)PHYS_BASE; upage += PGSIZE) {
+    void* kpage = pagedir_get_page(cur->pcb->pagedir, upage);
+    if (kpage == NULL)
+      continue; // 此页未映射，跳过
+
+    /* 分配新物理页并复制内容 */
+    void* new_page = palloc_get_page(PAL_USER);
+    if (new_page == NULL) {
+      /* 清理：释放已分配的所有页 */
+      pagedir_destroy(child_pd); // 会自动释放所有已映射的页
+      list_remove(&my_status->elem);
+      free(my_status);
+      return TID_ERROR;
+    }
+    memcpy(new_page, kpage, PGSIZE);
+
+    /* 判断父进程中此页是否可写 */
+    uint32_t* pde = cur->pcb->pagedir + pd_no(upage);
+    uint32_t* pt = pde_get_pt(*pde);
+    uint32_t* pte = &pt[pt_no(upage)];
+    bool writable = (*pte & PTE_W) != 0;
+
+    /* 映射到子进程页目录 */
+    if (!pagedir_set_page(child_pd, upage, new_page, writable)) {
+      palloc_free_page(new_page);
+      pagedir_destroy(child_pd);
+      list_remove(&my_status->elem);
+      free(my_status);
+      return TID_ERROR;
+    }
+  }
+
+  /* 4. 创建 fork_args 传给子线程 */
+  fargs = malloc(sizeof(struct fork_args));
+  if (fargs == NULL) {
+    pagedir_destroy(child_pd);
+    list_remove(&my_status->elem);
+    free(my_status);
+    return TID_ERROR;
+  }
+
+  fargs->parent_frame = *f; // 拷贝整个 intr_frame！（不是存指针）
+  fargs->child_pagedir = child_pd;
+  fargs->my_status = my_status;
+  fargs->fd_table = cur->pcb->fd_table; // 共享父进程的文件描述符表
+  fargs->parent_exec_file = cur->pcb->exec_file;
+
+  /* 5. 创建子线程 */
+  tid = thread_create(cur->pcb->process_name, PRI_DEFAULT, start_fork, fargs);
+  if (tid == TID_ERROR) {
+    pagedir_destroy(child_pd);
+    free(fargs);
+    list_remove(&my_status->elem);
+    free(my_status);
+    return TID_ERROR;
+  }
+
+  my_status->pid = tid;
+
+  /* 6. fork 不需要等待子进程加载——子进程直接从当前状态继续 */
+  // load_sema 已经初始化为 0，但子线程 start_fork 不需要 signal 它
+  // 因为 fork() 直接返回，不需要 exec 那样的加载等待
+  // 直接 sema_up，让可能的等待者立即通过
+  sema_up(&my_status->load_sema);
+
+  return tid;
+}
+
+/* 子进程线程入口 */
+static void start_fork(void* args_) {
+  struct fork_args* fargs = (struct fork_args*)args_;
+  struct intr_frame child_if;
+  struct thread* t = thread_current();
+  struct process* new_pcb;
+
+  /* 分配并初始化子进程 PCB */
+  new_pcb = malloc(sizeof(struct process));
+  if (new_pcb == NULL) {
+    pagedir_destroy(fargs->child_pagedir);
+    free(fargs);
+    // 通知父进程我们 failed
+    thread_exit();
+  }
+
+  /* Copy parent's fd_table: same struct file pointers (shared positions) */
+  struct fd_table* child_fd = malloc(sizeof(struct fd_table));
+  if (child_fd != NULL) {
+    memcpy(child_fd, fargs->fd_table, sizeof(struct fd_table));
+    for (int i = 0; i < 128; i++)
+      if (child_fd->entries[i] != NULL)
+        child_fd->inherited[i] = true;
+  }
+
+  new_pcb->pagedir = fargs->child_pagedir;
+  new_pcb->fd_table = child_fd;
+  new_pcb->main_thread = t;
+  list_init(&new_pcb->children);
+
+  /* Child gets its own exec_file handle (independent deny_write refcounting) */
+  if (fargs->parent_exec_file != NULL)
+    new_pcb->exec_file = file_reopen(fargs->parent_exec_file);
+  else
+    new_pcb->exec_file = NULL;
+
+  t->pcb = new_pcb;
+  t->pcb->my_status = fargs->my_status;
+  strlcpy(t->pcb->process_name, thread_current()->name, sizeof t->pcb->process_name);
+
+  /* 复制父进程的寄存器状态 */
+  child_if = fargs->parent_frame;
+
+  /* fork 在子进程中返回 0 */
+  child_if.eax = 0;
+
+  /* 释放 fork_args（不再需要） */
+  free(fargs);
+
+  /* 激活子进程的页目录 */
+  process_activate();
+
+  /* 跳入用户空间 */
+  asm volatile("movl %0, %%esp; jmp intr_exit" : : "g"(&child_if) : "memory");
+  NOT_REACHED();
+}
+
 /* Waits for process with PID child_pid to die and returns its exit status.
    If it was terminated by the kernel (i.e. killed due to an
    exception), returns -1.  If child_pid is invalid or if it was not a
@@ -138,9 +441,18 @@ static void start_process(void* file_name_) {
 
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
-int process_wait(pid_t child_pid UNUSED) {
-  sema_down(&temporary);
-  return 0;
+int process_wait(pid_t child_pid) {
+  struct child_status* cs = get_child_by_pid(child_pid);
+  if (cs == NULL)
+    return -1;
+
+  if (cs->is_alive)
+    sema_down(&cs->wait_sema);
+
+  int status = cs->exit_status;
+  list_remove(&cs->elem);
+  free(cs);
+  return status;
 }
 
 /* Free the current process's resources. */
@@ -152,6 +464,32 @@ void process_exit(void) {
   if (cur->pcb == NULL) {
     thread_exit();
     NOT_REACHED();
+  }
+
+  if (cur->pcb->my_status != NULL)
+    printf("%s: exit(%d)\n", cur->pcb->process_name, cur->pcb->my_status->exit_status);
+
+  struct list_elem* e;
+  for (e = list_begin(&cur->pcb->children); e != list_end(&cur->pcb->children);) {
+    struct child_status* child_status = list_entry(e, struct child_status, elem);
+    e = list_next(e);
+    if (!child_status->is_alive) {
+      list_remove(&child_status->elem);
+      free(child_status);
+    }
+  }
+
+  if (cur->pcb->exec_file != NULL)
+    file_close(cur->pcb->exec_file);
+
+  if (cur->pcb->fd_table != NULL) {
+    for (int i = 0; i < 128; i++) {
+      if (cur->pcb->fd_table->entries[i] != NULL
+          && !cur->pcb->fd_table->inherited[i]) {
+        file_close(cur->pcb->fd_table->entries[i]);
+      }
+    }
+    free(cur->pcb->fd_table);
   }
 
   /* Destroy the current process's page directory and switch back
@@ -178,7 +516,6 @@ void process_exit(void) {
   cur->pcb = NULL;
   free(pcb_to_free);
 
-  sema_up(&temporary);
   thread_exit();
 }
 
@@ -562,3 +899,104 @@ void pthread_exit(void) {}
    This function will be implemented in Project 2: Multithreading. For
    now, it does nothing. */
 void pthread_exit_main(void) {}
+
+struct child_status* get_child_by_pid(pid_t pid) {
+  struct thread* cur = thread_current();
+  struct list* children_list = &cur->pcb->children;
+  struct list_elem* e;
+
+  for (e = list_begin(children_list); e != list_end(children_list); e = list_next(e)) {
+    struct child_status* child = list_entry(e, struct child_status, elem);
+    if (child->pid == pid) {
+      return child;
+    }
+  }
+  return NULL;
+}
+
+int store_fd(struct process* pcb, struct file* f, int fd) {
+  if (pcb == NULL || f == NULL)
+    return -1;
+
+  // TODO: lock
+  if (pcb->fd_table == NULL) {
+    pcb->fd_table = malloc(sizeof(struct fd_table));
+    if (pcb->fd_table == NULL) {
+      return -1;
+    }
+    for (int i = 0; i < 128; i++) {
+      pcb->fd_table->entries[i] = NULL;
+      pcb->fd_table->inherited[i] = false;
+    }
+    pcb->fd_table->next_fd = 2;
+  }
+
+  /* Auto-assign: scan for a free slot starting from next_fd */
+  if (fd == -1) {
+    int start = pcb->fd_table->next_fd;
+    for (int i = 0; i < 128; i++) {
+      int slot = (start + i) % 128;
+      if (slot < 2)
+        continue; // skip stdin/stdout
+      if (pcb->fd_table->entries[slot] == NULL) {
+        pcb->fd_table->entries[slot] = f;
+        pcb->fd_table->inherited[slot] = false;
+        pcb->fd_table->next_fd = (slot + 1) % 128;
+        if (pcb->fd_table->next_fd < 2)
+          pcb->fd_table->next_fd = 2;
+        return slot;
+      }
+    }
+    return -1; // table full
+  }
+
+  /* Manual assignment: use the specified fd slot */
+  if (fd < 2 || fd >= 128)
+    return -1;
+
+  pcb->fd_table->entries[fd] = f;
+  pcb->fd_table->inherited[fd] = false;
+
+  if (fd >= pcb->fd_table->next_fd) {
+    pcb->fd_table->next_fd = fd + 1;
+    if (pcb->fd_table->next_fd >= 128)
+      pcb->fd_table->next_fd = 2;
+  }
+
+  return fd;
+}
+
+int remove_fd(struct process* pcb, int fd) {
+  if (pcb == NULL || pcb->fd_table == NULL)
+    return -1;
+
+  /* stdin/stdout cannot be closed */
+  if (fd == 0 || fd == 1)
+    return 0;
+
+  if (fd < 2 || fd >= 128)
+    return -1;
+
+  struct file* f = pcb->fd_table->entries[fd];
+  if (f == NULL) {
+    return -1;
+  }
+
+  pcb->fd_table->entries[fd] = NULL;
+
+  if (fd < pcb->fd_table->next_fd) {
+    pcb->fd_table->next_fd = fd;
+  }
+
+  return fd;
+}
+
+struct file* get_kernel_fd(struct process* pcb, int fd) {
+  if (pcb == NULL || pcb->fd_table == NULL)
+    return NULL;
+
+  if (fd < 0 || fd >= 128)
+    return NULL;
+
+  return pcb->fd_table->entries[fd];
+}
