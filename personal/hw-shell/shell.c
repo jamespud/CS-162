@@ -37,12 +37,25 @@ pid_t shell_pgid;
 char** path_array;
 int path_arr_len;
 
+typedef struct bg_job {
+  pid_t pid;
+  int job_id;
+  char* cmd;
+  struct bg_job* next;
+} bg_job_t;
+
+bg_job_t* bg_jobs;
+int next_job_id;
+
 int cmd_exit(struct tokens* tokens);
 int cmd_help(struct tokens* tokens);
 int cmd_pwd(struct tokens* tokens);
 int cmd_cd(struct tokens* tokens);
-void run_external(struct tokens* tokens, int start, int end);
-void signal_handler(int signum);
+int cmd_wait(struct tokens* tokens);
+int cmd_fg(struct tokens* tokens);
+int cmd_bg(struct tokens* tokens);
+void run_external(struct tokens* tokens, int start, int end, bool foreground);
+void reap_zombies(void);
 
 /* Built-in command functions take token array (see parse.h) and return int */
 typedef int cmd_fun_t(struct tokens* tokens);
@@ -64,6 +77,9 @@ fun_desc_t cmd_table[] = {
     {cmd_exit, "exit", "exit the command shell"},
     {cmd_pwd, "pwd", "show working dir"},
     {cmd_cd, "cd", "change dir"},
+    {cmd_wait, "wait", "wait for background jobs"},
+    {cmd_fg, "fg", "move job to foreground"},
+    {cmd_bg, "bg", "resume background job"},
     // {cmd_wc, "/usr/bin/wc", "word count"},
 };
 
@@ -204,12 +220,17 @@ char* lookup_path(char cmd[]) {
   return final_path;
 }
 
-void exec_cmd(struct tokens* tokens, int start, int end) {
-  if (tcsetpgrp(shell_terminal, getpgid(0)) == -1) {
-    perror("tcsetpgrp");
-    _exit(1);
+void exec_cmd(struct tokens* tokens, int start, int end, bool foreground) {
+  if (foreground) {
+    if (shell_is_interactive) {
+      if (tcsetpgrp(shell_terminal, getpgid(0)) == -1) {
+        perror("tcsetpgrp");
+        _exit(1);
+      }
+    }
   }
 
+  // 所有子进程都重置信号为默认（包括后台，fg 提前台需要）
   signal(SIGINT, SIG_DFL);
   signal(SIGTSTP, SIG_DFL);
   signal(SIGQUIT, SIG_DFL);
@@ -230,7 +251,7 @@ void exec_cmd(struct tokens* tokens, int start, int end) {
   _exit(127);
 }
 
-int cmd_run(struct tokens* tokens, int start, int end) {
+int cmd_run(struct tokens* tokens, int start, int end, bool foreground) {
   pid_t pid = fork();
   if (pid < 0) {
     perror("fork");
@@ -238,16 +259,29 @@ int cmd_run(struct tokens* tokens, int start, int end) {
   }
   if (pid == 0) {
     setpgid(0, 0);
-    exec_cmd(tokens, start, end);
+    exec_cmd(tokens, start, end, foreground);
   }
   setpgid(pid, pid);
-  int status;
-  waitpid(pid, &status, 0);
-  tcsetpgrp(shell_terminal, shell_pgid);
-  if (WIFSIGNALED(status))
-    fprintf(stderr, "Killed by signal %d\n", WTERMSIG(status));
-  if (WIFEXITED(status)) return WEXITSTATUS(status);
-  return -1;
+  if (foreground) {
+    int status;
+    waitpid(pid, &status, 0);
+    if (shell_is_interactive)
+      tcsetpgrp(shell_terminal, shell_pgid);
+    if (WIFSIGNALED(status))
+      fprintf(stderr, "Killed by signal %d\n", WTERMSIG(status));
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
+  } else {
+    char* cmd_name = tokens_get_token(tokens, start);
+    bg_job_t* job = malloc(sizeof(bg_job_t));
+    job->pid = pid;
+    job->job_id = next_job_id++;
+    job->cmd = strdup(cmd_name ? cmd_name : "unknown");
+    job->next = bg_jobs;
+    bg_jobs = job;
+    printf("[%d] %d\n", job->job_id, pid);
+    return 0;
+  }
 }
 
 void init_path() {
@@ -292,7 +326,7 @@ int count_pipes(struct tokens* tokens) {
   return n;
 }
 
-cmd_segment_t* pipe_segment(struct tokens* tokens, int num_pipe) {
+cmd_segment_t* pipe_segment(struct tokens* tokens, int num_pipe, size_t len) {
   int num_procs = num_pipe + 1;
   cmd_segment_t* segs = malloc(sizeof(cmd_segment_t) * num_procs);
   if (!segs) {
@@ -300,7 +334,6 @@ cmd_segment_t* pipe_segment(struct tokens* tokens, int num_pipe) {
     exit(1);
   }
 
-  size_t len = tokens_get_length(tokens);
   int seg_idx = 0;
   int seg_start = 0;
   for (size_t i = 0; i < len; i++) {
@@ -318,9 +351,9 @@ cmd_segment_t* pipe_segment(struct tokens* tokens, int num_pipe) {
   return segs;
 }
 
-void cmd_pipe(struct tokens* tokens, int num_pipe) {
+void cmd_pipe(struct tokens* tokens, int num_pipe, int total_tokens, bool foreground) {
   int num_procs = num_pipe + 1;
-  int fds[num_pipe][2];  // num_pipe=0 时为 VLA[0]，单命令不该走这里
+  int fds[num_pipe][2];
   for (int i = 0; i < num_pipe; i++) {
     if (pipe(fds[i]) < 0) {
       perror("pipe");
@@ -328,7 +361,7 @@ void cmd_pipe(struct tokens* tokens, int num_pipe) {
     }
   }
 
-  cmd_segment_t* segs = pipe_segment(tokens, num_pipe);
+  cmd_segment_t* segs = pipe_segment(tokens, num_pipe, total_tokens);
   pid_t pids[num_procs];
 
   for (int i = 0; i < num_procs; i++) {
@@ -346,7 +379,7 @@ void cmd_pipe(struct tokens* tokens, int num_pipe) {
         close(fds[j][0]);
         close(fds[j][1]);
       }
-      exec_cmd(tokens, segs[i].start, segs[i].end);
+      exec_cmd(tokens, segs[i].start, segs[i].end, foreground);
     } else {
       pids[i] = pid;
       if (i == 0)
@@ -362,13 +395,25 @@ void cmd_pipe(struct tokens* tokens, int num_pipe) {
     close(fds[j][1]);
   }
   // 等待全部子进程
-  for (int i = 0; i < num_procs; i++) {
-    int status;
-    waitpid(pids[i], &status, 0);
-    if (WIFSIGNALED(status))
-      fprintf(stderr, "Killed by signal %d\n", WTERMSIG(status));
+  if (foreground) {
+    for (int i = 0; i < num_procs; i++) {
+      int status;
+      waitpid(pids[i], &status, 0);
+      if (WIFSIGNALED(status))
+        fprintf(stderr, "Killed by signal %d\n", WTERMSIG(status));
+    }
+    if (shell_is_interactive)
+      tcsetpgrp(shell_terminal, shell_pgid);
+  } else {
+    char* cmd_name = tokens_get_token(tokens, segs[0].start);
+    bg_job_t* job = malloc(sizeof(bg_job_t));
+    job->pid = pids[0];
+    job->job_id = next_job_id++;
+    job->cmd = strdup(cmd_name ? cmd_name : "unknown");
+    job->next = bg_jobs;
+    bg_jobs = job;
+    printf("[%d] %d\n", job->job_id, pids[0]);
   }
-  tcsetpgrp(shell_terminal, shell_pgid);
 
   free(segs);
 }
@@ -380,8 +425,129 @@ void destroy_path() {
   free(path_array);
 }
 
-void run_external(struct tokens* tokens, int start, int end) {
-  cmd_run(tokens, start, end);
+void run_external(struct tokens* tokens, int start, int end, bool foreground) {
+  cmd_run(tokens, start, end, foreground);
+}
+
+void reap_zombies(void) {
+  int status;
+  pid_t pid;
+  while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+    bg_job_t** prev = &bg_jobs;
+    while (*prev) {
+      if ((*prev)->pid == pid) {
+        bg_job_t* dead = *prev;
+        *prev = dead->next;
+        if (WIFSIGNALED(status))
+          fprintf(stderr, "[%d] %d Killed by signal %d\n",
+                  dead->job_id, dead->pid, WTERMSIG(status));
+        else
+          fprintf(stderr, "[%d] %d Done\n", dead->job_id, dead->pid);
+        free(dead->cmd);
+        free(dead);
+        break;
+      }
+      prev = &(*prev)->next;
+    }
+  }
+}
+
+int cmd_wait(unused struct tokens* tokens) {
+  int status;
+  pid_t pid;
+  while (bg_jobs) {
+    pid = waitpid(-1, &status, 0);
+    if (pid < 0) break;
+    bg_job_t** prev = &bg_jobs;
+    while (*prev) {
+      if ((*prev)->pid == pid) {
+        bg_job_t* done = *prev;
+        *prev = done->next;
+        if (WIFSIGNALED(status))
+          fprintf(stderr, "[%d] %d Killed by signal %d\n",
+                  done->job_id, done->pid, WTERMSIG(status));
+        free(done->cmd);
+        free(done);
+        break;
+      }
+      prev = &(*prev)->next;
+    }
+  }
+  return 0;
+}
+
+int cmd_fg(struct tokens* tokens) {
+  pid_t target;
+  size_t argc = tokens_get_length(tokens);
+
+  if (argc > 1) {
+    target = atoi(tokens_get_token(tokens, 1));
+  } else if (bg_jobs) {
+    target = bg_jobs->pid;
+  } else {
+    fprintf(stderr, "fg: no current job\n");
+    return 1;
+  }
+
+  /* 从链表中查找 */
+  bg_job_t** prev = &bg_jobs;
+  bg_job_t* job = NULL;
+  while (*prev) {
+    if ((*prev)->pid == target) {
+      job = *prev;
+      break;
+    }
+    prev = &(*prev)->next;
+  }
+  if (!job) {
+    fprintf(stderr, "fg: %d: no such job\n", target);
+    return 1;
+  }
+
+  /* 切换到前台并恢复 */
+  tcsetpgrp(shell_terminal, getpgid(target));
+  kill(target, SIGCONT);
+
+  int status;
+  waitpid(target, &status, 0);
+  tcsetpgrp(shell_terminal, shell_pgid);
+
+  /* 从链表中移除 */
+  *prev = job->next;
+  if (WIFSIGNALED(status))
+    fprintf(stderr, "Killed by signal %d\n", WTERMSIG(status));
+  free(job->cmd);
+  free(job);
+  return WIFEXITED(status) ? WEXITSTATUS(status) : 0;
+}
+
+int cmd_bg(struct tokens* tokens) {
+  pid_t target;
+  size_t argc = tokens_get_length(tokens);
+
+  if (argc > 1) {
+    target = atoi(tokens_get_token(tokens, 1));
+  } else if (bg_jobs) {
+    target = bg_jobs->pid;  // 最近启动的
+  } else {
+    fprintf(stderr, "bg: no current job\n");
+    return 1;
+  }
+
+  /* 从链表中查找 */
+  bg_job_t* job = bg_jobs;
+  while (job) {
+    if (job->pid == target) break;
+    job = job->next;
+  }
+  if (!job) {
+    fprintf(stderr, "bg: %d: no such job\n", target);
+    return 1;
+  }
+
+  kill(target, SIGCONT);
+  printf("[%d] %d\n", job->job_id, target);
+  return 0;
 }
 
 /* Intialization procedures for this shell */
@@ -389,12 +555,11 @@ void init_shell() {
   /* Our shell is connected to standard input. */
   shell_terminal = open("/dev/tty", O_RDWR);
   if (shell_terminal < 0) {
-    perror("open /dev/tty");
-    exit(1);
+    shell_terminal = STDIN_FILENO;
   }
 
   /* Check if we are running interactively */
-  shell_is_interactive = isatty(shell_terminal);
+  shell_is_interactive = isatty(STDIN_FILENO);
 
   if (shell_is_interactive) {
     /* If the shell is not currently in the foreground, we must pause the shell
@@ -427,21 +592,32 @@ int main(unused int argc, unused char* argv[]) {
   init_shell();
   init_path();
 
+  bg_jobs = NULL;
+  next_job_id = 1;
+
   static char line[4096];
-  int line_num = 0;
+  // int line_num = 0;
 
   /* Please only print shell prompts when standard input is not a tty */
-  if (shell_is_interactive) fprintf(stdout, "%d: ", line_num);
+  // if (shell_is_interactive) fprintf(stdout, "%d: ", line_num);
 
   while (fgets(line, 4096, stdin)) {
+    reap_zombies();
+
     /* Split our line into words. */
     struct tokens* tokens = tokenize(line);
     int argc = tokens_get_length(tokens);
 
     if (argc == 0) {
-      if (shell_is_interactive) fprintf(stdout, "%d: ", ++line_num);
+      // if (shell_is_interactive) fprintf(stdout, "%d: ", ++line_num);
       tokens_destroy(tokens);
       continue;
+    }
+
+    bool foreground = true;
+    if (argc > 0 && strcmp(tokens_get_token(tokens, argc - 1), "&") == 0) {
+      foreground = false;
+      argc--;
     }
 
     char* cmd = tokens_get_token(tokens, 0);
@@ -450,20 +626,20 @@ int main(unused int argc, unused char* argv[]) {
     int fundex = lookup(cmd);
     if (fundex >= 0) {
       cmd_table[fundex].fun(tokens);
-    } else if (fundex == -1) {
+    } else {
       int num_pipe = count_pipes(tokens);
       if (num_pipe > 0) {
-        cmd_pipe(tokens, num_pipe);
+        cmd_pipe(tokens, num_pipe, argc, foreground);
       } else if ((fundex = lookup(cmd)) >= 0) {
         cmd_table[fundex].fun(tokens);
       } else {
-        run_external(tokens, 0, argc);
+        run_external(tokens, 0, argc, foreground);
       }
     }
 
-    if (shell_is_interactive)
+    // if (shell_is_interactive)
       /* Please only print shell prompts when standard input is not a tty */
-      fprintf(stdout, "%d: ", ++line_num);
+      // fprintf(stdout, "%d: ", ++line_num);
 
     /* Clean up memory */
     tokens_destroy(tokens);
