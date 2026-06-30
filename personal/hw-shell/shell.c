@@ -1,6 +1,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -10,7 +11,6 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
-#include <limits.h>
 
 #include "tokenizer.h"
 
@@ -39,10 +39,10 @@ int path_arr_len;
 
 int cmd_exit(struct tokens* tokens);
 int cmd_help(struct tokens* tokens);
-// int cmd_wc(struct tokens* tokens);
 int cmd_pwd(struct tokens* tokens);
 int cmd_cd(struct tokens* tokens);
-bool run_external(struct tokens* tokens, int start, int end);
+void run_external(struct tokens* tokens, int start, int end);
+void signal_handler(int signum);
 
 /* Built-in command functions take token array (see parse.h) and return int */
 typedef int cmd_fun_t(struct tokens* tokens);
@@ -204,25 +204,30 @@ char* lookup_path(char cmd[]) {
   return final_path;
 }
 
-int cmd_run(char* full_path, struct tokens* tokens, int start, int end) {
+void exec_cmd(struct tokens* tokens, int start, int end) {
+  apply_redirection(tokens, start, end);
+  char* cmd = tokens_get_token(tokens, start);
+  char* full_path = lookup_path(cmd);
+  if (!full_path) {
+    fprintf(stderr, "%s: command not found\n", cmd);
+    _exit(127);
+  }
   int span = end - start;
-  char* argv[span + 2];  // argv[0]=full_path + 区间内 token + NULL
+  char* argv[span + 2];
   argv[0] = full_path;
-  build_argv(tokens, start, end, argv, 1);  // 从 argv[1] 开始填
+  build_argv(tokens, start, end, argv, 1);
+  execv(full_path, argv);
+  _exit(127);
+}
 
+int cmd_run(struct tokens* tokens, int start, int end) {
   pid_t pid = fork();
   if (pid < 0) {
     perror("fork");
-    free(full_path);
     return 1;
   }
-  if (pid == 0) {
-    apply_redirection(tokens, start, end);
-    execv(full_path, argv);
-    _exit(127);
-  }
+  if (pid == 0) exec_cmd(tokens, start, end);  // 不返回
   int status;
-  free(full_path);
   waitpid(pid, &status, 0);
   if (WIFEXITED(status)) return WEXITSTATUS(status);
   return -1;
@@ -316,29 +321,13 @@ void cmd_pipe(struct tokens* tokens, int num_pipe) {
       exit(1);
     }
     if (pids[i] == 0) {
-      // 子进程：连接 pipe
       if (i > 0) dup2(fds[i - 1][0], STDIN_FILENO);
       if (i < num_procs - 1) dup2(fds[i][1], STDOUT_FILENO);
-      // 关闭本进程持有的全部 pipe fd（dup2 已复制，原始 fd 可关）
       for (int j = 0; j < num_pipe; j++) {
         close(fds[j][0]);
         close(fds[j][1]);
       }
-      // 文件重定向（覆盖 pipe dup2，显式重定向优先）
-      apply_redirection(tokens, segs[i].start, segs[i].end);
-      // 解析并 exec
-      char* cmd = tokens_get_token(tokens, segs[i].start);
-      char* full_path = lookup_path(cmd);
-      if (!full_path) {
-        fprintf(stderr, "shell: %s: command not found\n", cmd);
-        _exit(127);
-      }
-      int span = segs[i].end - segs[i].start;
-      char* argv[span + 2];
-      argv[0] = full_path;
-      build_argv(tokens, segs[i].start, segs[i].end, argv, 1);
-      execv(full_path, argv);
-      _exit(127);
+      exec_cmd(tokens, segs[i].start, segs[i].end);  // 不返回
     }
   }
 
@@ -361,12 +350,8 @@ void destroy_path() {
   free(path_array);
 }
 
-bool run_external(struct tokens* tokens, int start, int end) {
-  char* cmd = tokens_get_token(tokens, start);
-  char* full_path = lookup_path(cmd);
-  if (full_path == NULL) return false;
-  cmd_run(full_path, tokens, start, end);
-  return true;
+void run_external(struct tokens* tokens, int start, int end) {
+  cmd_run(tokens, start, end);
 }
 
 /* Intialization procedures for this shell */
@@ -429,9 +414,7 @@ int main(unused int argc, unused char* argv[]) {
       } else if ((fundex = lookup(cmd)) >= 0) {
         cmd_table[fundex].fun(tokens);
       } else {
-        bool ran = run_external(tokens, 0, argc);
-        if (!ran)
-          fprintf(stdout, "This shell doesn't know how to run programs.\n");
+        run_external(tokens, 0, argc);
       }
     }
 
