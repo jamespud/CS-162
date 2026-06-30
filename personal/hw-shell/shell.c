@@ -205,6 +205,16 @@ char* lookup_path(char cmd[]) {
 }
 
 void exec_cmd(struct tokens* tokens, int start, int end) {
+  if (tcsetpgrp(shell_terminal, getpgid(0)) == -1) {
+    perror("tcsetpgrp");
+    _exit(1);
+  }
+
+  signal(SIGINT, SIG_DFL);
+  signal(SIGTSTP, SIG_DFL);
+  signal(SIGQUIT, SIG_DFL);
+  signal(SIGTTOU, SIG_DFL);
+
   apply_redirection(tokens, start, end);
   char* cmd = tokens_get_token(tokens, start);
   char* full_path = lookup_path(cmd);
@@ -226,9 +236,16 @@ int cmd_run(struct tokens* tokens, int start, int end) {
     perror("fork");
     return 1;
   }
-  if (pid == 0) exec_cmd(tokens, start, end);  // 不返回
+  if (pid == 0) {
+    setpgid(0, 0);
+    exec_cmd(tokens, start, end);
+  }
+  setpgid(pid, pid);
   int status;
   waitpid(pid, &status, 0);
+  tcsetpgrp(shell_terminal, shell_pgid);
+  if (WIFSIGNALED(status))
+    fprintf(stderr, "Killed by signal %d\n", WTERMSIG(status));
   if (WIFEXITED(status)) return WEXITSTATUS(status);
   return -1;
 }
@@ -315,19 +332,27 @@ void cmd_pipe(struct tokens* tokens, int num_pipe) {
   pid_t pids[num_procs];
 
   for (int i = 0; i < num_procs; i++) {
-    pids[i] = fork();
-    if (pids[i] < 0) {
+    pid_t pid = fork();
+    if (pid < 0) {
       perror("fork");
       exit(1);
     }
-    if (pids[i] == 0) {
+    if (pid == 0) {
+      if (i == 0) setpgid(0, 0);
+      else setpgid(0, pids[0]);
       if (i > 0) dup2(fds[i - 1][0], STDIN_FILENO);
       if (i < num_procs - 1) dup2(fds[i][1], STDOUT_FILENO);
       for (int j = 0; j < num_pipe; j++) {
         close(fds[j][0]);
         close(fds[j][1]);
       }
-      exec_cmd(tokens, segs[i].start, segs[i].end);  // 不返回
+      exec_cmd(tokens, segs[i].start, segs[i].end);
+    } else {
+      pids[i] = pid;
+      if (i == 0)
+        setpgid(pid, pid);
+      else
+        setpgid(pid, pids[0]);
     }
   }
 
@@ -340,9 +365,14 @@ void cmd_pipe(struct tokens* tokens, int num_pipe) {
   for (int i = 0; i < num_procs; i++) {
     int status;
     waitpid(pids[i], &status, 0);
+    if (WIFSIGNALED(status))
+      fprintf(stderr, "Killed by signal %d\n", WTERMSIG(status));
   }
+  tcsetpgrp(shell_terminal, shell_pgid);
+
   free(segs);
 }
+
 void destroy_path() {
   for (int i = 0; i < path_arr_len; i++) {
     free(path_array[i]);
@@ -357,7 +387,11 @@ void run_external(struct tokens* tokens, int start, int end) {
 /* Intialization procedures for this shell */
 void init_shell() {
   /* Our shell is connected to standard input. */
-  shell_terminal = STDIN_FILENO;
+  shell_terminal = open("/dev/tty", O_RDWR);
+  if (shell_terminal < 0) {
+    perror("open /dev/tty");
+    exit(1);
+  }
 
   /* Check if we are running interactively */
   shell_is_interactive = isatty(shell_terminal);
@@ -378,6 +412,15 @@ void init_shell() {
     /* Save the current termios to a variable, so it can be restored later. */
     tcgetattr(shell_terminal, &shell_tmodes);
   }
+
+  struct sigaction sa;
+  sa.sa_handler = SIG_IGN;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGTSTP, &sa, NULL);
+  sigaction(SIGQUIT, &sa, NULL);
+  sigaction(SIGTTOU, &sa, NULL);
 }
 
 int main(unused int argc, unused char* argv[]) {
