@@ -32,6 +32,12 @@ char* server_files_directory;
 char* server_proxy_hostname;
 int server_proxy_port;
 
+typedef struct proxy_socket {
+  int running;
+  int source_fd;
+  int target_fd;
+} proxy_socket_t;
+
 ssize_t write_all(int fd, const void* buf, size_t count) {
   size_t bytes_written = 0;
   const char* ptr = (const char*)buf;
@@ -48,6 +54,18 @@ ssize_t write_all(int fd, const void* buf, size_t count) {
     bytes_written += res;
   }
   return bytes_written;
+}
+
+void* proxy_halder(void* arg) {
+  proxy_socket_t* ps = (proxy_socket_t*)arg;
+  char buffer[4096];
+  ssize_t bytes_read;
+
+  while ((bytes_read = read(ps->source_fd, buffer, sizeof(buffer))) > 0) {
+    if (write_all(ps->target_fd, buffer, bytes_read) < 0) {
+      break;
+    }
+  }
 }
 
 /*
@@ -265,6 +283,29 @@ void handle_proxy_request(int fd) {
 
   /* TODO: PART 4 */
   /* PART 4 BEGIN */
+
+  pthread_t threads[2];
+  proxy_socket_t client_ps;
+  proxy_socket_t target_ps;
+
+  client_ps.source_fd = fd;
+  client_ps.target_fd = target_fd;
+  target_ps.source_fd = target_fd;
+  target_ps.target_fd = fd;
+  int rc;
+
+  rc = pthread_create(&threads[0], NULL, proxy_halder, (void*)&client_ps);
+  if (rc != 0) {
+    perror("pthread_create");
+  }
+
+  rc = pthread_create(&threads[1], NULL, proxy_halder, (void*)&target_ps);
+  if (rc != 0) {
+    perror("pthread_create");
+  }
+
+  wait(threads[0]);
+  wait(threads[1]);
 
   /* PART 4 END */
 }
