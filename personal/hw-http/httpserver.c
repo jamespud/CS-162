@@ -25,8 +25,9 @@
  * handle_proxy_request. Their values are set up in main() using the
  * command line arguments (already implemented for you).
  */
-wq_t work_queue;  // Only used by poolserver
-int num_threads;  // Only used by poolserver
+wq_t* work_queue;  // Only used by poolserver
+int num_threads;   // Only used by poolserver
+pthread_t* pool_threads;
 int server_port;  // Default value: 8000
 char* server_files_directory;
 char* server_proxy_hostname;
@@ -37,6 +38,11 @@ typedef struct proxy_socket {
   int source_fd;
   int target_fd;
 } proxy_socket_t;
+
+typedef struct thread_arg {
+  int client_socket_fd;
+  void (*request_handler)(int);
+} thread_arg_t;
 
 ssize_t write_all(int fd, const void* buf, size_t count) {
   size_t bytes_written = 0;
@@ -56,16 +62,39 @@ ssize_t write_all(int fd, const void* buf, size_t count) {
   return bytes_written;
 }
 
-void* proxy_halder(void* arg) {
+void* proxy_handler(void* arg) {
   proxy_socket_t* ps = (proxy_socket_t*)arg;
   char buffer[4096];
   ssize_t bytes_read;
 
-  while ((bytes_read = read(ps->source_fd, buffer, sizeof(buffer))) > 0) {
-    if (write_all(ps->target_fd, buffer, bytes_read) < 0) {
-      break;
+  while (1) {
+    bytes_read = read(ps->source_fd, buffer, sizeof(buffer));
+    if (bytes_read < 0) {
+      if (errno == EINTR) continue;  // interrupted by signal — retry
+      break;                         // real error
     }
+    if (bytes_read == 0) break;       // peer closed → we're done relaying
+    if (write_all(ps->target_fd, buffer, bytes_read) < 0) break;
   }
+
+  /*
+   * This direction is done. shutdown() the target so the *other* relay
+   * thread — which may still be blocked in read() on its source fd — wakes
+   * up with EOF (read returns 0) and exits too. Without this, the join in
+   * handle_proxy_request would block forever on the side that has nothing
+   * left to relay.
+   */
+  shutdown(ps->target_fd, SHUT_RDWR);
+  return NULL;
+}
+
+void* thread_handler(void* arg) {
+  thread_arg_t* thread_arg = (thread_arg_t*)arg;
+  void (*request_handler)(int) = thread_arg->request_handler;
+  int client_socket_fd = thread_arg->client_socket_fd;
+  request_handler(client_socket_fd);
+  free(arg);
+  return NULL;
 }
 
 /*
@@ -87,13 +116,13 @@ void serve_file(int fd, char* path) {
     return;
   }
 
-  char cotent_size_char[50];
-  snprintf(cotent_size_char, sizeof(cotent_size_char), "%ld",
+  char content_size_char[50];
+  snprintf(content_size_char, sizeof(content_size_char), "%ld",
            (long)file_stat.st_size);
 
   http_start_response(fd, 200);
   http_send_header(fd, "Content-Type", http_get_mime_type(path));
-  http_send_header(fd, "Content-Length", cotent_size_char);
+  http_send_header(fd, "Content-Length", content_size_char);
   http_end_headers(fd);
 
   char buffer[4096];
@@ -203,7 +232,6 @@ void handle_files_request(int fd) {
 
   struct stat file_stat;
   if (stat(path, &file_stat) == -1) {
-    printf("error: stat: %s", path);
     http_start_response(fd, 404);
     http_end_headers(fd);
   } else if (S_ISREG(file_stat.st_mode)) {
@@ -211,6 +239,8 @@ void handle_files_request(int fd) {
   } else if (S_ISDIR(file_stat.st_mode)) {
     serve_directory(fd, path);
   }
+
+  free(path);
 
   /* PART 2 & 3 END */
 
@@ -284,28 +314,49 @@ void handle_proxy_request(int fd) {
   /* TODO: PART 4 */
   /* PART 4 BEGIN */
 
-  pthread_t threads[2];
-  proxy_socket_t client_ps;
-  proxy_socket_t target_ps;
+  pthread_t* threads = malloc(2 * sizeof(pthread_t));
+  if (threads == NULL) {
+    perror("malloc");
+    return;
+  }
 
-  client_ps.source_fd = fd;
-  client_ps.target_fd = target_fd;
-  target_ps.source_fd = target_fd;
-  target_ps.target_fd = fd;
+  proxy_socket_t* client_ps = malloc(sizeof(proxy_socket_t));
+  if (client_ps == NULL) {
+    perror("malloc");
+    return;
+  }
+
+  proxy_socket_t* target_ps = malloc(sizeof(proxy_socket_t));
+  if (target_ps == NULL) {
+    perror("malloc");
+    return;
+  }
+
+  client_ps->source_fd = fd;
+  client_ps->target_fd = target_fd;
+  target_ps->source_fd = target_fd;
+  target_ps->target_fd = fd;
   int rc;
 
-  rc = pthread_create(&threads[0], NULL, proxy_halder, (void*)&client_ps);
+  rc = pthread_create(&threads[0], NULL, proxy_handler, (void*)client_ps);
   if (rc != 0) {
     perror("pthread_create");
   }
 
-  rc = pthread_create(&threads[1], NULL, proxy_halder, (void*)&target_ps);
+  rc = pthread_create(&threads[1], NULL, proxy_handler, (void*)target_ps);
   if (rc != 0) {
     perror("pthread_create");
   }
 
-  wait(threads[0]);
-  wait(threads[1]);
+  pthread_join(threads[0], NULL);
+  pthread_join(threads[1], NULL);
+
+  close(fd);
+  close(target_fd);
+
+  free(threads);
+  free(client_ps);
+  free(target_ps);
 
   /* PART 4 END */
 }
@@ -326,6 +377,11 @@ void* handle_clients(void* void_request_handler) {
   /* TODO: PART 7 */
   /* PART 7 BEGIN */
 
+  while (1) {
+    int client_socket_fd = wq_pop(work_queue);
+    request_handler(client_socket_fd);
+  }
+
   /* PART 7 END */
 }
 
@@ -335,6 +391,29 @@ void* handle_clients(void* void_request_handler) {
 void init_thread_pool(int num_threads, void (*request_handler)(int)) {
   /* TODO: PART 7 */
   /* PART 7 BEGIN */
+  work_queue = malloc(sizeof(wq_t));
+  if (work_queue == NULL) {
+    perror("malloc");
+    exit(1);
+  }
+
+  pool_threads = malloc(sizeof(pthread_t) * num_threads);
+  if (pool_threads == NULL) {
+    free(work_queue);
+    perror("malloc");
+    exit(1);
+  }
+
+  wq_init(work_queue);
+
+  for (size_t i = 0; i < num_threads; i++) {
+    int res =
+        pthread_create(&pool_threads[i], NULL, handle_clients, request_handler);
+    if (res != 0) {
+      perror("pthread_create");
+      exit(1);
+    }
+  }
 
   /* PART 7 END */
 }
@@ -384,13 +463,13 @@ void serve_forever(int* socket_number, void (*request_handler)(int)) {
   if (bind(*socket_number, (struct sockaddr*)&server_address,
            sizeof(server_address)) == -1) {
     perror("bind");
-    close(socket_number);
+    close(*socket_number);
     exit(1);
   }
 
-  if (listen(*socket_number, 3) == -1) {
+  if (listen(*socket_number, 1024) == -1) {
     perror("listen");
-    close(socket_number);
+    close(*socket_number);
     exit(1);
   }
 
@@ -442,6 +521,27 @@ void serve_forever(int* socket_number, void (*request_handler)(int)) {
 
     /* PART 5 BEGIN */
 
+    int pid = fork();
+    if (pid < 0) {
+      perror("fork");
+      close(client_socket_number);
+      continue;
+    }
+
+    if (pid == 0) {
+      /* Child: serve the request, then exit. Closing the listening socket
+       * is unnecessary (it's COW-shared) but harmless. */
+      request_handler(client_socket_number);
+      exit(0);
+    } else {
+      /* Parent: it owns no interest in this client fd, drop its reference.
+       * Reap finished children non-blockingly so zombies don't accumulate
+       * under load. */
+      close(client_socket_number);
+      while (waitpid(-1, NULL, WNOHANG) > 0) {
+      }
+    }
+
     /* PART 5 END */
 
 #elif THREADSERVER
@@ -457,6 +557,28 @@ void serve_forever(int* socket_number, void (*request_handler)(int)) {
 
     /* PART 6 BEGIN */
 
+    pthread_t thread;
+    thread_arg_t* arg_t = malloc(sizeof(thread_arg_t));
+
+    if (arg_t == NULL) {
+      perror("malloc");
+      close(client_socket_number);
+      continue;
+    }
+
+    arg_t->client_socket_fd = client_socket_number;
+    arg_t->request_handler = request_handler;
+
+    int res = pthread_create(&thread, NULL, thread_handler, arg_t);
+    if (res != 0) {
+      perror("pthread_create");
+      free(arg_t);
+      close(client_socket_number);
+    } else {
+      pthread_detach(thread);
+    }
+    
+
     /* PART 6 END */
 #elif POOLSERVER
     /*
@@ -468,6 +590,8 @@ void serve_forever(int* socket_number, void (*request_handler)(int)) {
      */
 
     /* PART 7 BEGIN */
+
+    wq_push(work_queue, client_socket_number);
 
     /* PART 7 END */
 #endif
