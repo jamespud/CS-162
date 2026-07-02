@@ -3,11 +3,11 @@
 #include "filesys/filesys.h"
 #include "threads/interrupt.h"
 #include "threads/malloc.h"
+#include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "userprog/pagedir.h"
 #include "userprog/process.h"
-#include "threads/synch.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <syscall-nr.h>
@@ -89,174 +89,204 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
 
   /* printf("System call number: %d\n", args[0]); */
 
-  if (args[0] == SYS_EXIT) {
-    check_valid_bytes(args, 2 * sizeof(uint32_t));
-    f->eax = args[1];
-    exit_process((int)args[1]);
-  } else if (args[0] == SYS_WRITE) {
-    check_valid_bytes(args, 4 * sizeof(uint32_t));
-    int fd = (int)args[1];
-    const void* buffer = (const void*)args[2];
-    unsigned size = (unsigned)args[3];
+  switch (args[0]) {
+    case SYS_EXIT: {
+      check_valid_bytes(args, 2 * sizeof(uint32_t));
+      f->eax = args[1];
+      exit_process((int)args[1]);
+      break;
+    }
+    case SYS_WRITE: {
+      check_valid_bytes(args, 4 * sizeof(uint32_t));
+      int fd = (int)args[1];
+      const void* buffer = (const void*)args[2];
+      unsigned size = (unsigned)args[3];
 
-    if (fd == 1) {
-      check_valid_bytes(buffer, size);
-      putbuf(buffer, size);
-      f->eax = size;
-    } else {
+      if (fd == 1) {
+        check_valid_bytes(buffer, size);
+        putbuf(buffer, size);
+        f->eax = size;
+      } else {
+        lock_acquire(&filesys_lock);
+        struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
+        if (file_ptr == NULL) {
+          lock_release(&filesys_lock);
+          f->eax = -1;
+        } else {
+          check_valid_bytes(buffer, size);
+          int n = file_write(file_ptr, buffer, size);
+          lock_release(&filesys_lock);
+          f->eax = n;
+        }
+      }
+      break;
+    }
+    case SYS_PRACTICE: {
+      check_valid_bytes(args, 2 * sizeof(uint32_t));
+      f->eax = args[1] + 1;
+      break;
+    }
+    case SYS_HALT: {
+      shutdown_power_off();
+      break;
+    }
+    case SYS_EXEC: {
+      check_valid_bytes(args, 2 * sizeof(uint32_t));
+      const char* cmd_line = (const char*)args[1];
+      check_valid_bytes(cmd_line, safe_strlen(cmd_line) + 1);
+      pid_t child_pid = process_execute(cmd_line);
+
+      if (child_pid == TID_ERROR) {
+        f->eax = -1;
+      } else {
+        struct child_status* child_status = get_child_by_pid(child_pid);
+        sema_down(&child_status->load_sema);
+        if (!child_status->load_success) {
+          f->eax = -1;
+        } else {
+          f->eax = child_pid;
+        }
+      }
+      break;
+    }
+    case SYS_WAIT: {
+      check_valid_bytes(args, 2 * sizeof(uint32_t));
+      struct child_status* child_status = get_child_by_pid((pid_t)args[1]);
+
+      if (child_status == NULL) {
+        f->eax = -1;
+        break;
+      }
+      if (child_status->is_waited) {
+        f->eax = -1;
+        break;
+      }
+
+      if (child_status->is_alive) {
+        sema_down(&child_status->wait_sema);
+      }
+
+      child_status->is_waited = true;
+      f->eax = child_status->exit_status;
+      list_remove(&child_status->elem);
+      free(child_status);
+      break;
+    }
+    case SYS_FORK: {
+      f->eax = process_fork(f);
+      break;
+    }
+    case SYS_CREATE: {
+      check_valid_bytes(args, 2 * sizeof(uint32_t));
+      const char* file = (const char*)args[1];
+      unsigned initial_size = (unsigned)args[2];
+      check_valid_bytes(file, safe_strlen(file) + 1);
+      lock_acquire(&filesys_lock);
+      f->eax = filesys_create(file, initial_size);
+      lock_release(&filesys_lock);
+      break;
+    }
+    case SYS_REMOVE: {
+      check_valid_bytes(args, 2 * sizeof(uint32_t));
+      const char* file = (const char*)args[1];
+      check_valid_bytes(file, safe_strlen(file) + 1);
+      lock_acquire(&filesys_lock);
+      f->eax = filesys_remove(file);
+      lock_release(&filesys_lock);
+      break;
+    }
+    case SYS_OPEN: {
+      check_valid_bytes(args, 2 * sizeof(uint32_t));
+      const char* file = (const char*)args[1];
+      check_valid_bytes(file, safe_strlen(file) + 1);
+      lock_acquire(&filesys_lock);
+      struct file* file_ptr = filesys_open(file);
+      if (file_ptr == NULL) {
+        lock_release(&filesys_lock);
+        f->eax = -1;
+      } else {
+        int result = store_fd(thread_current()->pcb, file_ptr, -1);
+        lock_release(&filesys_lock);
+        f->eax = result;
+      }
+      break;
+    }
+    case SYS_FILESIZE: {
+      check_valid_bytes(args, 2 * sizeof(uint32_t));
+      int fd = (int)args[1];
       lock_acquire(&filesys_lock);
       struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
       if (file_ptr == NULL) {
         lock_release(&filesys_lock);
         f->eax = -1;
       } else {
-        check_valid_bytes(buffer, size);
-        int n = file_write(file_ptr, buffer, size);
+        off_t sz = file_length(file_ptr);
+        lock_release(&filesys_lock);
+        f->eax = sz;
+      }
+      break;
+    }
+    case SYS_READ: {
+      check_valid_bytes(args, 4 * sizeof(uint32_t));
+      int fd = (int)args[1];
+      void* buffer = (void*)args[2];
+      unsigned size = (unsigned)args[3];
+      check_valid_bytes(buffer, size);
+      lock_acquire(&filesys_lock);
+      struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
+      if (file_ptr == NULL) {
+        lock_release(&filesys_lock);
+        f->eax = -1;
+      } else {
+        int n = file_read(file_ptr, buffer, size);
         lock_release(&filesys_lock);
         f->eax = n;
       }
+      break;
     }
-  } else if (args[0] == SYS_PRACTICE) {
-    check_valid_bytes(args, 2 * sizeof(uint32_t));
-    f->eax = args[1] + 1;
-  } else if (args[0] == SYS_HALT) {
-    shutdown_power_off();
-  } else if (args[0] == SYS_EXEC) {
-    check_valid_bytes(args, 2 * sizeof(uint32_t));
-    const char* cmd_line = (const char*)args[1];
-    check_valid_bytes(cmd_line, safe_strlen(cmd_line) + 1);
-    pid_t child_pid = process_execute(cmd_line);
-
-    if (child_pid == TID_ERROR) {
-      f->eax = -1;
-    } else {
-      struct child_status* child_status = get_child_by_pid(child_pid);
-      sema_down(&child_status->load_sema);
-      if (!child_status->load_success) {
+    case SYS_SEEK: {
+      check_valid_bytes(args, 3 * sizeof(uint32_t));
+      int fd = (int)args[1];
+      unsigned position = (unsigned)args[2];
+      lock_acquire(&filesys_lock);
+      struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
+      if (file_ptr != NULL) {
+        file_seek(file_ptr, position);
+      }
+      lock_release(&filesys_lock);
+      break;
+    }
+    case SYS_TELL: {
+      check_valid_bytes(args, 2 * sizeof(uint32_t));
+      int fd = (int)args[1];
+      lock_acquire(&filesys_lock);
+      struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
+      if (file_ptr == NULL) {
+        lock_release(&filesys_lock);
         f->eax = -1;
       } else {
-        f->eax = child_pid;
+        off_t pos = file_tell(file_ptr);
+        lock_release(&filesys_lock);
+        f->eax = pos;
       }
+      break;
     }
-  } else if (args[0] == SYS_WAIT) {
-    check_valid_bytes(args, 2 * sizeof(uint32_t));
-    struct child_status* child_status = get_child_by_pid((pid_t)args[1]);
-
-    if (child_status == NULL) {
-      f->eax = -1;
-      return;
-    }
-    if (child_status->is_waited) {
-      f->eax = -1;
-      return;
-    }
-
-    if (child_status->is_alive) {
-      sema_down(&child_status->wait_sema);
-    }
-
-    child_status->is_waited = true;
-    f->eax = child_status->exit_status;
-    list_remove(&child_status->elem);
-    free(child_status);
-  } else if (args[0] == SYS_FORK) {
-    f->eax = process_fork(f);
-  } else if (args[0] == SYS_CREATE) {
-    check_valid_bytes(args, 2 * sizeof(uint32_t));
-    const char* file = (const char*)args[1];
-    unsigned initial_size = (unsigned)args[2];
-    check_valid_bytes(file, safe_strlen(file) + 1);
-    lock_acquire(&filesys_lock);
-    f->eax = filesys_create(file, initial_size);
-    lock_release(&filesys_lock);
-  } else if (args[0] == SYS_REMOVE) {
-    check_valid_bytes(args, 2 * sizeof(uint32_t));
-    const char* file = (const char*)args[1];
-    check_valid_bytes(file, safe_strlen(file) + 1);
-    lock_acquire(&filesys_lock);
-    f->eax = filesys_remove(file);
-    lock_release(&filesys_lock);
-  } else if (args[0] == SYS_OPEN) {
-    check_valid_bytes(args, 2 * sizeof(uint32_t));
-    const char* file = (const char*)args[1];
-    check_valid_bytes(file, safe_strlen(file) + 1);
-    lock_acquire(&filesys_lock);
-    struct file* file_ptr = filesys_open(file);
-    if (file_ptr == NULL) {
+    case SYS_CLOSE: {
+      check_valid_bytes(args, 2 * sizeof(uint32_t));
+      int fd = (int)args[1];
+      struct process* pcb = thread_current()->pcb;
+      lock_acquire(&filesys_lock);
+      struct file* file_ptr = (struct file*)get_kernel_fd(pcb, fd);
+      /* Skip file_close for inherited fds to avoid double-close on shared struct file */
+      if (file_ptr != NULL) {
+        bool inherited =
+            (fd >= 0 && fd < 128 && pcb->fd_table != NULL && pcb->fd_table->inherited[fd]);
+        if (!inherited)
+          file_close(file_ptr);
+      }
+      remove_fd(pcb, fd);
       lock_release(&filesys_lock);
-      f->eax = -1;
-    } else {
-      int result = store_fd(thread_current()->pcb, file_ptr, -1);
-      lock_release(&filesys_lock);
-      f->eax = result;
+      break;
     }
-  } else if (args[0] == SYS_FILESIZE) {
-    check_valid_bytes(args, 2 * sizeof(uint32_t));
-    int fd = (int)args[1];
-    lock_acquire(&filesys_lock);
-    struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
-    if (file_ptr == NULL) {
-      lock_release(&filesys_lock);
-      f->eax = -1;
-    } else {
-      off_t sz = file_length(file_ptr);
-      lock_release(&filesys_lock);
-      f->eax = sz;
-    }
-  } else if (args[0] == SYS_READ) {
-    check_valid_bytes(args, 4 * sizeof(uint32_t));
-    int fd = (int)args[1];
-    void* buffer = (void*)args[2];
-    unsigned size = (unsigned)args[3];
-    check_valid_bytes(buffer, size);
-    lock_acquire(&filesys_lock);
-    struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
-    if (file_ptr == NULL) {
-      lock_release(&filesys_lock);
-      f->eax = -1;
-    } else {
-      int n = file_read(file_ptr, buffer, size);
-      lock_release(&filesys_lock);
-      f->eax = n;
-    }
-  } else if (args[0] == SYS_SEEK) {
-    check_valid_bytes(args, 3 * sizeof(uint32_t));
-    int fd = (int)args[1];
-    unsigned position = (unsigned)args[2];
-    lock_acquire(&filesys_lock);
-    struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
-    if (file_ptr != NULL) {
-      file_seek(file_ptr, position);
-    }
-    lock_release(&filesys_lock);
-  } else if (args[0] == SYS_TELL) {
-    check_valid_bytes(args, 2 * sizeof(uint32_t));
-    int fd = (int)args[1];
-    lock_acquire(&filesys_lock);
-    struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
-    if (file_ptr == NULL) {
-      lock_release(&filesys_lock);
-      f->eax = -1;
-    } else {
-      off_t pos = file_tell(file_ptr);
-      lock_release(&filesys_lock);
-      f->eax = pos;
-    }
-  } else if (args[0] == SYS_CLOSE) {
-    check_valid_bytes(args, 2 * sizeof(uint32_t));
-    int fd = (int)args[1];
-    struct process* pcb = thread_current()->pcb;
-    lock_acquire(&filesys_lock);
-    struct file* file_ptr = (struct file*)get_kernel_fd(pcb, fd);
-    /* Skip file_close for inherited fds to avoid double-close on shared struct file */
-    if (file_ptr != NULL) {
-      bool inherited = (fd >= 0 && fd < 128
-                        && pcb->fd_table != NULL
-                        && pcb->fd_table->inherited[fd]);
-      if (!inherited)
-        file_close(file_ptr);
-    }
-    remove_fd(pcb, fd);
-    lock_release(&filesys_lock);
   }
 }
