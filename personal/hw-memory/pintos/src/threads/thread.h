@@ -99,6 +99,9 @@ struct thread {
 
   struct file* open_file; /* Single open file supported. */
   bool in_syscall;        /* Stores if we are in a syscall. */
+
+  uint8_t* heap_start;    /* Start of the process heap. */
+  uint8_t* heap_end;      /* Current end of the process heap (the break). */
 #endif
 
   /* Owned by thread.c. */

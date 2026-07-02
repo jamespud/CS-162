@@ -203,6 +203,7 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
   off_t file_ofs;
   bool success = false;
   int i;
+  uint32_t bss_end = 0; // Track the end of the loaded segments
 
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create();
@@ -267,12 +268,25 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
             read_bytes = 0;
             zero_bytes = ROUND_UP(page_offset + phdr.p_memsz, PGSIZE);
           }
+          /* Track highest virtual address used by segments */
+          uint32_t segment_end = phdr.p_vaddr + phdr.p_memsz;
+          if (segment_end > bss_end) {
+              bss_end = segment_end;
+          }
           if (!load_segment(file, file_page, (void*)mem_page, read_bytes, zero_bytes, writable))
             goto done;
         } else
           goto done;
         break;
     }
+  }
+
+  if (bss_end != 0) {
+      t->heap_start = (uint8_t*) ROUND_UP(bss_end, PGSIZE);
+      t->heap_end = t->heap_start;
+  } else {
+      t->heap_start = NULL;
+      t->heap_end = NULL;
   }
 
   /* Set up stack. */
