@@ -10,6 +10,8 @@
 #define MAX_STACK_PAGES (1 << 11)
 #define MAX_THREADS 127
 #define THREAD_STACK_SLOT_SIZE (1 << 20)
+#define USER_LOCK_SIZE 256
+#define USER_SEMA_SIZE 256
 
 /* PIDs and TIDs are the same type. PID should be
    the TID of the main thread of the process */
@@ -52,6 +54,9 @@ struct process {
   struct fd_table* fd_table;      /* 文件描述符表 */
   struct file* exec_file;         /* 可执行文件，用于 ROX 保护 */
   struct list thread_statuses;    /* 进程中的所有线程 */
+
+  struct lock* user_locks[USER_LOCK_SIZE];      // 索引 → 内核 lock 指针
+  struct semaphore* user_semas[USER_SEMA_SIZE]; // 同理
 };
 
 void userprog_init(void);

@@ -171,6 +171,8 @@ static void start_process(void* args_) {
     t->pcb->my_status = my_status;
     list_init(&new_pcb->children);
     list_init(&new_pcb->thread_statuses);
+    memset(new_pcb->user_locks, 0, USER_LOCK_SIZE);
+    memset(new_pcb->user_semas, 0, USER_SEMA_SIZE);
 
     status_node_init(tsn);
     t->status_node = tsn;
@@ -506,12 +508,15 @@ void process_exit(void) {
     }
   }
 
-  // for (e = list_begin(&cur->pcb->thread_statuses); e != list_end(&cur->pcb->thread_statuses);
-  //      e = list_next(e)) {
-  //   struct thread_status_node* tsn = list_entry(e, struct thread_status_node, elem);
-  //   list_remove(tsn);
-  //   free(tsn);
-  // }
+  for (e = list_begin(&cur->pcb->thread_statuses); e != list_end(&cur->pcb->thread_statuses);
+       e = list_next(e)) {
+    struct thread_status_node* tsn = list_entry(e, struct thread_status_node, elem);
+    list_remove(tsn);
+    free(tsn);
+  }
+
+  free(cur->pcb->user_locks);
+  free(cur->pcb->user_semas);
 
   if (cur->pcb->exec_file != NULL)
     file_close(cur->pcb->exec_file);
@@ -974,7 +979,6 @@ tid_t pthread_execute(stub_fun sf UNUSED, pthread_fun tf UNUSED, void* arg UNUSE
 static void start_pthread(void* exec_ UNUSED) {
   pthread_arg_t* exec_args = (pthread_arg_t*)exec_;
   struct thread* t = thread_current();
-  char* args = (char*)exec_args->arg;
   struct intr_frame if_;
 
   t->pcb = exec_args->pcb;
@@ -1032,11 +1036,12 @@ tid_t pthread_join(tid_t tid UNUSED) {
 
   tsn->is_joined = true;
   if (tsn->is_exited) {
-    list_remove(tsn);
+    list_remove(&tsn->elem);
     free(tsn);
     return tid;
   }
 
+  free(tsn);
   sema_down(&tsn->join_sema);
   return tid;
 }

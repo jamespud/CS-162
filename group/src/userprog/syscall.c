@@ -1,3 +1,4 @@
+// #include "user/syscall.h"
 #include "devices/shutdown.h"
 #include "filesys/filesys.h"
 #include "threads/interrupt.h"
@@ -73,6 +74,103 @@ static size_t safe_strlen(const void* vaddr) {
     p++;
     len++;
   }
+}
+
+static bool syscall_lock_init(char* lock) {
+  struct process* pcb = thread_current()->pcb;
+  uint32_t idx = -1;
+
+  for (size_t i = 0; i < USER_LOCK_SIZE; i++) {
+    if (pcb->user_locks[i] == NULL) {
+      idx = i;
+      break;
+    }
+  }
+  if (idx == -1) {
+    return false;
+  }
+
+  struct lock* kernel_lock = malloc(sizeof(struct lock));
+  if (kernel_lock == NULL) {
+    return false;
+  }
+  lock_init(kernel_lock);
+  pcb->user_locks[idx] = kernel_lock;
+  *lock = (char)idx;
+  return true;
+}
+
+static bool syscall_lock_acquire(char* lock) {
+  struct process* pcb = thread_current()->pcb;
+  unsigned char idx = *(unsigned char*)lock;
+  struct lock* kernel_lock = pcb->user_locks[idx];
+
+  if (kernel_lock == NULL || lock_held_by_current_thread(kernel_lock)) {
+    return false;
+  }
+
+  return lock_try_acquire(kernel_lock);
+}
+
+static bool syscall_lock_release(char* lock) {
+  struct process* pcb = thread_current()->pcb;
+  unsigned char idx = *(unsigned char*)lock;
+  struct lock* kernel_lock = pcb->user_locks[idx];
+
+  if (kernel_lock == NULL || !lock_held_by_current_thread(kernel_lock)) {
+    return false;
+  }
+
+  lock_release(kernel_lock);
+  return true;
+}
+
+static bool syscall_sema_init(char* sema, int val) {
+  struct process* pcb = thread_current()->pcb;
+  uint32_t idx = -1;
+
+  for (size_t i = 0; i < USER_SEMA_SIZE; i++) {
+    if (pcb->user_semas[i] == NULL) {
+      idx = i;
+      break;
+    }
+  }
+  if (idx == -1) {
+    return false;
+  }
+
+  struct semaphore* kernel_sema = malloc(sizeof(struct semaphore));
+  if (kernel_sema == NULL) {
+    return false;
+  }
+  sema_init(kernel_sema, val);
+  pcb->user_semas[idx] = kernel_sema;
+  *sema = (char)idx;
+  return true;
+}
+
+static bool syscall_sema_down(char* sema) {
+  struct process* pcb = thread_current()->pcb;
+  unsigned char idx = *(unsigned char*)sema;
+  struct semaphore* kernel_sema = pcb->user_semas[idx];
+
+  if (kernel_sema == NULL) {
+    return false;
+  }
+  sema_down(kernel_sema);
+  return true;
+}
+
+static bool syscall_sema_up(char* sema) {
+  struct process* pcb = thread_current()->pcb;
+  unsigned char idx = *(unsigned char*)sema;
+  struct semaphore* kernel_sema = pcb->user_semas[idx];
+
+  if (kernel_sema == NULL) {
+    return false;
+  }
+  sema_up(kernel_sema);
+  return true;
 }
 
 static void syscall_handler(struct intr_frame* f UNUSED) {
@@ -302,8 +400,38 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
       break;
     }
     case SYS_PT_JOIN: {
-      check_valid_bytes(args, sizeof(tid_t));
+      check_valid_bytes(args, 2 * sizeof(uint32_t));
       f->eax = pthread_join((tid_t)args[1]);
+      break;
+    }
+    case SYS_LOCK_INIT: {
+      check_valid_bytes(args, 2 * sizeof(uint32_t));
+      f->eax = syscall_lock_init((char*)args[1]);
+      break;
+    }
+    case SYS_LOCK_ACQUIRE: {
+      check_valid_bytes(args, 2 * sizeof(uint32_t));
+      f->eax = syscall_lock_acquire((char*)args[1]);
+      break;
+    }
+    case SYS_LOCK_RELEASE: {
+      check_valid_bytes(args, 2 * sizeof(uint32_t));
+      f->eax = syscall_lock_release((char*)args[1]);
+      break;
+    }
+    case SYS_SEMA_INIT: {
+      check_valid_bytes(args, 3 * sizeof(uint32_t));
+      f->eax = syscall_sema_init((char*)args[1], (int)args[2]);
+      break;
+    }
+    case SYS_SEMA_DOWN: {
+      check_valid_bytes(args, 2 * sizeof(uint32_t));
+      f->eax = syscall_sema_down((char*)args[1]);
+      break;
+    }
+    case SYS_SEMA_UP: {
+      check_valid_bytes(args, 2 * sizeof(uint32_t));
+      f->eax = syscall_sema_up((char*)args[1]);
       break;
     }
     default: {
