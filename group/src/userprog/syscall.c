@@ -1,4 +1,3 @@
-#include "userprog/syscall.h"
 #include "devices/shutdown.h"
 #include "filesys/filesys.h"
 #include "threads/interrupt.h"
@@ -286,6 +285,23 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
       }
       remove_fd(pcb, fd);
       lock_release(&filesys_lock);
+      break;
+    }
+    case SYS_PT_CREATE: {
+      check_valid_bytes(args, 4 * sizeof(uint32_t));
+      stub_fun sfun = (stub_fun)args[1];
+      pthread_fun tfun = (pthread_fun)args[2];
+      const void* arg = (const void*)args[3];
+      check_valid_ptr(sfun);
+      check_valid_ptr(tfun);
+      f->eax = pthread_execute(sfun, tfun, (void*)arg);
+      break;
+    }
+    case SYS_PT_EXIT: {
+      pthread_exit();
+    }
+    default: {
+      printf("Unimplemented system call: %d\n", (int)args[0]);
       break;
     }
   }

@@ -24,7 +24,7 @@
 static thread_func start_process NO_RETURN;
 static thread_func start_pthread NO_RETURN;
 static bool load(const char* file_name, void (**eip)(void), void** esp);
-bool setup_thread(void (**eip)(void), void** esp);
+bool setup_thread(stub_fun sfun, pthread_fun tfun, void* arg, void (**eip)(void), void** esp);
 
 struct exec_args {
   char* file_name;
@@ -38,6 +38,14 @@ struct fork_args {
   struct fd_table* fd_table;      // 文件描述符表
   struct file* parent_exec_file;  // 父进程的可执行文件句柄
 };
+
+typedef struct pthread_arg {
+  stub_fun sfun;
+  pthread_fun tfun;
+  void* arg;
+  struct thread_status_node* status_node;
+  struct process* pcb;
+} pthread_arg_t;
 
 /* Initializes user programs in the system by ensuring the main
    thread has a minimal PCB so that it can execute and wait for
@@ -69,6 +77,7 @@ void userprog_init(void) {
   t->pcb->fd_table->next_fd = 2;
 
   list_init(&t->pcb->children);
+  list_init(&t->pcb->thread_statuses);
   t->pcb->my_status = NULL;
 }
 
@@ -151,6 +160,7 @@ static void start_process(void* args_) {
 
     t->pcb->my_status = my_status;
     list_init(&new_pcb->children);
+    list_init(&new_pcb->thread_statuses);
 
     // Continue initializing the PCB as normal
     t->pcb->main_thread = t;
@@ -404,6 +414,7 @@ static void start_fork(void* args_) {
   new_pcb->fd_table = child_fd;
   new_pcb->main_thread = t;
   list_init(&new_pcb->children);
+  list_init(&new_pcb->thread_statuses);
 
   /* Child gets its own exec_file handle (independent deny_write refcounting) */
   if (fargs->parent_exec_file != NULL)
@@ -484,8 +495,7 @@ void process_exit(void) {
 
   if (cur->pcb->fd_table != NULL) {
     for (int i = 0; i < 128; i++) {
-      if (cur->pcb->fd_table->entries[i] != NULL
-          && !cur->pcb->fd_table->inherited[i]) {
+      if (cur->pcb->fd_table->entries[i] != NULL && !cur->pcb->fd_table->inherited[i]) {
         file_close(cur->pcb->fd_table->entries[i]);
       }
     }
@@ -817,6 +827,21 @@ static bool setup_stack(void** esp) {
   return success;
 }
 
+static bool setup_pthread_stack(void** esp, void* base, size_t offset) {
+  uint8_t* kpage;
+  bool success = false;
+
+  kpage = palloc_get_page(PAL_USER | PAL_ZERO);
+  if (kpage != NULL) {
+    success = install_page(base - offset, kpage, true);
+    if (success)
+      *esp = (uint8_t*)base - (uintptr_t)offset + PGSIZE;
+    else
+      palloc_free_page(kpage);
+  }
+  return success;
+}
+
 /* Adds a mapping from user virtual address UPAGE to kernel
    virtual address KPAGE to the page table.
    If WRITABLE is true, the user process may modify the page;
@@ -849,7 +874,30 @@ pid_t get_pid(struct process* p) { return (pid_t)p->main_thread->tid; }
    This function will be implemented in Project 2: Multithreading. For
    now, it does nothing. You may find it necessary to change the
    function signature. */
-bool setup_thread(void (**eip)(void) UNUSED, void** esp UNUSED) { return false; }
+bool setup_thread(stub_fun sfun, pthread_fun tfun, void* arg, void (**eip)(void), void** esp) {
+  struct thread* t = thread_current();
+  bool success = false;
+
+  success = setup_pthread_stack(esp, PHYS_BASE, t->tid * THREAD_STACK_SLOT_SIZE);
+  if (!success) {
+    return false;
+  }
+
+  uint8_t* sp = (uint8_t*)(*esp);
+
+  sp -= sizeof(void*);
+  *(void**)sp = arg;
+
+  sp -= sizeof(pthread_fun);
+  *(pthread_fun*)sp = tfun;
+
+  sp -= sizeof(void*);
+  *(void**)sp = 0;
+
+  *esp = sp;
+  *eip = sfun;
+  return true;
+}
 
 /* Starts a new thread with a new user stack running SF, which takes
    TF and ARG as arguments on its user stack. This new thread may be
@@ -860,7 +908,35 @@ bool setup_thread(void (**eip)(void) UNUSED, void** esp UNUSED) { return false; 
    This function will be implemented in Project 2: Multithreading and
    should be similar to process_execute (). For now, it does nothing.
    */
-tid_t pthread_execute(stub_fun sf UNUSED, pthread_fun tf UNUSED, void* arg UNUSED) { return -1; }
+tid_t pthread_execute(stub_fun sf UNUSED, pthread_fun tf UNUSED, void* arg UNUSED) {
+  struct thread_status_node* tsn = malloc(sizeof(struct thread_status_node));
+  if (tsn == NULL) {
+    return -1;
+  }
+  // TODO: Initialize tsn
+
+  struct thread* t = thread_current();
+  list_push_back(&t->pcb->thread_statuses, &tsn->elem);
+
+  pthread_arg_t* exec_args = malloc(sizeof(pthread_arg_t));
+  exec_args->arg = arg;
+  exec_args->status_node = tsn;
+  exec_args->sfun = sf;
+  exec_args->tfun = tf;
+  exec_args->pcb = t->pcb;
+
+  tid_t tid = thread_create("pthread", PRI_DEFAULT, start_pthread, exec_args);
+
+  if (tid == TID_ERROR) {
+    list_remove(&tsn->elem);
+    free(tsn);
+    free(exec_args);
+  } else {
+    tsn->tid = tid;
+  }
+
+  return tid;
+}
 
 /* A thread function that creates a new user thread and starts it
    running. Responsible for adding itself to the list of threads in
@@ -868,7 +944,29 @@ tid_t pthread_execute(stub_fun sf UNUSED, pthread_fun tf UNUSED, void* arg UNUSE
 
    This function will be implemented in Project 2: Multithreading and
    should be similar to start_process (). For now, it does nothing. */
-static void start_pthread(void* exec_ UNUSED) {}
+static void start_pthread(void* exec_ UNUSED) {
+  pthread_arg_t* exec_args = (pthread_arg_t*)exec_;
+  struct thread* t = thread_current();
+  char* args = (char*)exec_args->arg;
+  struct intr_frame if_;
+
+  t->pcb = exec_args->pcb;
+  t->status_node = exec_args->status_node;
+
+  memset(&if_, 0, sizeof if_);
+  if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
+  if_.cs = SEL_UCSEG;
+  if_.eflags = FLAG_IF | FLAG_MBS;
+
+  bool success = setup_thread(exec_args->sfun, exec_args->tfun, exec_args->arg, &if_.eip, &if_.esp);
+
+  free(exec_args);
+
+  process_activate();
+
+  asm volatile("movl %0, %%esp; jmp intr_exit" : : "g"(&if_) : "memory");
+  NOT_REACHED();
+}
 
 /* Waits for thread with TID to die, if that thread was spawned
    in the same process and has not been waited on yet. Returns TID on
@@ -888,7 +986,16 @@ tid_t pthread_join(tid_t tid UNUSED) { return -1; }
 
    This function will be implemented in Project 2: Multithreading. For
    now, it does nothing. */
-void pthread_exit(void) {}
+void pthread_exit(void) {
+  struct thread* cur = thread_current();
+
+  struct thread_status_node* tsn = cur->status_node;
+  if (tsn != NULL) {
+    tsn->is_exited = true;
+  }
+
+  thread_exit();
+}
 
 /* Only to be used when the main thread explicitly calls pthread_exit.
    The main thread should wait on all threads in the process to

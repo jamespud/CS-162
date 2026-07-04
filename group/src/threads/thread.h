@@ -18,12 +18,22 @@ enum thread_status {
 /* Thread identifier type.
    You can redefine this to whatever type you like. */
 typedef int tid_t;
-#define TID_ERROR ((tid_t)-1) /* Error value for tid_t. */
+#define TID_ERROR ((tid_t) - 1) /* Error value for tid_t. */
 
 /* Thread priorities. */
 #define PRI_MIN 0      /* Lowest priority. */
 #define PRI_DEFAULT 31 /* Default priority. */
 #define PRI_MAX 63     /* Highest priority. */
+
+#ifdef USERPROG
+struct thread_status_node {
+  tid_t tid;                  // 目标线程的 TID
+  int exit_code;              // 退出状态码
+  bool is_exited;             // 是否已经退出（僵尸状态）
+  struct semaphore join_sema; // 用于 join 的信号量
+  struct list_elem elem;      // 挂在主线程/PCB 的子线程列表中
+};
+#endif
 
 /* A kernel thread or user process.
 
@@ -96,6 +106,7 @@ struct thread {
 #ifdef USERPROG
   /* Owned by process.c. */
   struct process* pcb; /* Process control block if this thread is a userprog */
+  struct thread_status_node* status_node; /* Pointer to this thread's status node in the parent process's list */
 #endif
 
   /* Owned by thread.c. */
