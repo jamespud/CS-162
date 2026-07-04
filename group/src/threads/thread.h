@@ -1,11 +1,11 @@
 #ifndef THREADS_THREAD_H
 #define THREADS_THREAD_H
 
+#include "threads/fixed-point.h"
+#include "threads/synch.h"
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
-#include "threads/synch.h"
-#include "threads/fixed-point.h"
 
 /* States in a thread's life cycle. */
 enum thread_status {
@@ -30,8 +30,9 @@ struct thread_status_node {
   tid_t tid;                  // 目标线程的 TID
   int exit_code;              // 退出状态码
   bool is_exited;             // 是否已经退出（僵尸状态）
+  bool is_joined;             // 当前线程是否已经 join
   struct semaphore join_sema; // 用于 join 的信号量
-  struct list_elem elem;      // 挂在主线程/PCB 的子线程列表中
+  struct list_elem elem;      // 挂在 PCB 的 thread_statuses
 };
 #endif
 

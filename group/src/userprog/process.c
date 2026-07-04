@@ -47,6 +47,13 @@ typedef struct pthread_arg {
   struct process* pcb;
 } pthread_arg_t;
 
+void status_node_init(struct thread_status_node* tsn) {
+  tsn->tid = TID_ERROR;
+  tsn->is_exited = false;
+  tsn->is_joined = false;
+  sema_init(&tsn->join_sema, 0);
+}
+
 /* Initializes user programs in the system by ensuring the main
    thread has a minimal PCB so that it can execute and wait for
    the first user process. Any additions to the PCB should be also
@@ -151,6 +158,9 @@ static void start_process(void* args_) {
   struct process* new_pcb = malloc(sizeof(struct process));
   success = pcb_success = new_pcb != NULL;
 
+  struct thread_status_node* tsn = malloc(sizeof(struct thread_status_node));
+  success &= tsn != NULL;
+
   /* Initialize process control block */
   if (success) {
     // Ensure that timer_interrupt() -> schedule() -> process_activate()
@@ -161,6 +171,12 @@ static void start_process(void* args_) {
     t->pcb->my_status = my_status;
     list_init(&new_pcb->children);
     list_init(&new_pcb->thread_statuses);
+
+    status_node_init(tsn);
+    t->status_node = tsn;
+    tsn->tid = t->tid;
+
+    list_push_back(&new_pcb->thread_statuses, &tsn->elem);
 
     // Continue initializing the PCB as normal
     t->pcb->main_thread = t;
@@ -489,6 +505,13 @@ void process_exit(void) {
       free(child_status);
     }
   }
+
+  // for (e = list_begin(&cur->pcb->thread_statuses); e != list_end(&cur->pcb->thread_statuses);
+  //      e = list_next(e)) {
+  //   struct thread_status_node* tsn = list_entry(e, struct thread_status_node, elem);
+  //   list_remove(tsn);
+  //   free(tsn);
+  // }
 
   if (cur->pcb->exec_file != NULL)
     file_close(cur->pcb->exec_file);
@@ -911,14 +934,20 @@ bool setup_thread(stub_fun sfun, pthread_fun tfun, void* arg, void (**eip)(void)
 tid_t pthread_execute(stub_fun sf UNUSED, pthread_fun tf UNUSED, void* arg UNUSED) {
   struct thread_status_node* tsn = malloc(sizeof(struct thread_status_node));
   if (tsn == NULL) {
-    return -1;
+    return TID_ERROR;
   }
-  // TODO: Initialize tsn
+  status_node_init(tsn);
 
   struct thread* t = thread_current();
-  list_push_back(&t->pcb->thread_statuses, &tsn->elem);
 
   pthread_arg_t* exec_args = malloc(sizeof(pthread_arg_t));
+  if (exec_args == NULL) {
+    free(tsn);
+    return TID_ERROR;
+  }
+
+  list_push_back(&t->pcb->thread_statuses, &tsn->elem);
+
   exec_args->arg = arg;
   exec_args->status_node = tsn;
   exec_args->sfun = sf;
@@ -931,8 +960,6 @@ tid_t pthread_execute(stub_fun sf UNUSED, pthread_fun tf UNUSED, void* arg UNUSE
     list_remove(&tsn->elem);
     free(tsn);
     free(exec_args);
-  } else {
-    tsn->tid = tid;
   }
 
   return tid;
@@ -952,6 +979,9 @@ static void start_pthread(void* exec_ UNUSED) {
 
   t->pcb = exec_args->pcb;
   t->status_node = exec_args->status_node;
+  t->status_node->tid = t->tid;
+
+  process_activate();
 
   memset(&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
@@ -959,10 +989,11 @@ static void start_pthread(void* exec_ UNUSED) {
   if_.eflags = FLAG_IF | FLAG_MBS;
 
   bool success = setup_thread(exec_args->sfun, exec_args->tfun, exec_args->arg, &if_.eip, &if_.esp);
-
   free(exec_args);
-
-  process_activate();
+  if (!success) {
+    thread_exit();
+    NOT_REACHED();
+  }
 
   asm volatile("movl %0, %%esp; jmp intr_exit" : : "g"(&if_) : "memory");
   NOT_REACHED();
@@ -975,7 +1006,40 @@ static void start_pthread(void* exec_ UNUSED) {
 
    This function will be implemented in Project 2: Multithreading. For
    now, it does nothing. */
-tid_t pthread_join(tid_t tid UNUSED) { return -1; }
+tid_t pthread_join(tid_t tid UNUSED) {
+  struct thread* cur_thread = thread_current();
+  struct list* ts = &cur_thread->pcb->thread_statuses;
+
+  // target tsn
+  struct thread_status_node* tsn = NULL;
+
+  struct list_elem* e;
+  for (e = list_begin(ts); e != list_end(ts); e = list_next(e)) {
+    struct thread_status_node* tsn_elem = list_entry(e, struct thread_status_node, elem);
+    if (tsn_elem->tid == tid) {
+      tsn = tsn_elem;
+      break;
+    }
+  }
+
+  if (tsn == NULL) {
+    return TID_ERROR;
+  }
+
+  if (tsn->is_joined) {
+    return TID_ERROR;
+  }
+
+  tsn->is_joined = true;
+  if (tsn->is_exited) {
+    list_remove(tsn);
+    free(tsn);
+    return tid;
+  }
+
+  sema_down(&tsn->join_sema);
+  return tid;
+}
 
 /* Free the current thread's resources. Most resources will
    be freed on thread_exit(), so all we have to do is deallocate the
@@ -992,6 +1056,7 @@ void pthread_exit(void) {
   struct thread_status_node* tsn = cur->status_node;
   if (tsn != NULL) {
     tsn->is_exited = true;
+    sema_up(&tsn->join_sema);
   }
 
   thread_exit();

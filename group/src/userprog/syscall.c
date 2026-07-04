@@ -299,6 +299,12 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
     }
     case SYS_PT_EXIT: {
       pthread_exit();
+      break;
+    }
+    case SYS_PT_JOIN: {
+      check_valid_bytes(args, sizeof(tid_t));
+      f->eax = pthread_join((tid_t)args[1]);
+      break;
     }
     default: {
       printf("Unimplemented system call: %d\n", (int)args[0]);
