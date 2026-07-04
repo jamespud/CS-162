@@ -171,8 +171,8 @@ static void start_process(void* args_) {
     t->pcb->my_status = my_status;
     list_init(&new_pcb->children);
     list_init(&new_pcb->thread_statuses);
-    memset(new_pcb->user_locks, 0, USER_LOCK_SIZE);
-    memset(new_pcb->user_semas, 0, USER_SEMA_SIZE);
+    memset(new_pcb->user_locks, 0, sizeof(new_pcb->user_locks));
+    memset(new_pcb->user_semas, 0, sizeof(new_pcb->user_semas));
 
     status_node_init(tsn);
     t->status_node = tsn;
@@ -508,15 +508,23 @@ void process_exit(void) {
     }
   }
 
-  for (e = list_begin(&cur->pcb->thread_statuses); e != list_end(&cur->pcb->thread_statuses);
-       e = list_next(e)) {
+  for (e = list_begin(&cur->pcb->thread_statuses); e != list_end(&cur->pcb->thread_statuses);) {
     struct thread_status_node* tsn = list_entry(e, struct thread_status_node, elem);
-    list_remove(tsn);
+    e = list_next(e);
+    list_remove(&tsn->elem);
     free(tsn);
   }
 
-  free(cur->pcb->user_locks);
-  free(cur->pcb->user_semas);
+  for (size_t i = 0; i < USER_LOCK_SIZE; i++) {
+    if (cur->pcb->user_locks[i] != NULL) {
+      free(cur->pcb->user_locks[i]);
+    }
+  }
+  for (size_t i = 0; i < USER_SEMA_SIZE; i++) {
+    if (cur->pcb->user_semas[i] != NULL) {
+      free(cur->pcb->user_semas[i]);
+    }
+  }
 
   if (cur->pcb->exec_file != NULL)
     file_close(cur->pcb->exec_file);
@@ -965,6 +973,8 @@ tid_t pthread_execute(stub_fun sf UNUSED, pthread_fun tf UNUSED, void* arg UNUSE
     list_remove(&tsn->elem);
     free(tsn);
     free(exec_args);
+  } else {
+    tsn->tid = tid;
   }
 
   return tid;
@@ -1041,8 +1051,9 @@ tid_t pthread_join(tid_t tid UNUSED) {
     return tid;
   }
 
-  free(tsn);
   sema_down(&tsn->join_sema);
+  list_remove(&tsn->elem);
+  free(tsn);
   return tid;
 }
 
