@@ -99,17 +99,21 @@ struct thread {
   char name[16];             /* Name (for debugging purposes). */
   uint8_t* stack;            /* Saved stack pointer. */
   int priority;              /* Priority. */
-  struct list_elem allelem;  /* List element for all threads list. */
+  int effective_priority;
+  struct list_elem allelem; /* List element for all threads list. */
 
   /* Shared between thread.c and synch.c. */
   struct list_elem elem; /* List element. */
+  struct list locks_held;
+  struct lock* waiting_on_lock;
 
   int64_t wakeup_tick;
 
 #ifdef USERPROG
   /* Owned by process.c. */
   struct process* pcb; /* Process control block if this thread is a userprog */
-  struct thread_status_node* status_node; /* Pointer to this thread's status node in the parent process's list */
+  struct thread_status_node*
+      status_node; /* Pointer to this thread's status node in the parent process's list */
 #endif
 
   /* Owned by thread.c. */
@@ -157,6 +161,9 @@ void thread_foreach(thread_action_func*, void*);
 
 int thread_get_priority(void);
 void thread_set_priority(int);
+bool thread_priority_less(const struct list_elem* a_, const struct list_elem* b_, void* aux UNUSED);
+void thread_recompute_priority(struct thread *t);
+void thread_yield_if_not_highest(void);
 
 int thread_get_nice(void);
 void thread_set_nice(int);
