@@ -484,6 +484,44 @@ int process_wait(pid_t child_pid) {
   return status;
 }
 
+/* Detaches a user lock from the priority-donation graph and frees it.
+   Must be called with interrupts off. The holder, if any, has the lock
+   removed from its locks_held list and its effective priority recomputed.
+   Waiters are detached (their waiting_on_lock cleared) but left BLOCKED,
+   since the process is exiting and they must not run on. */
+static void release_user_lock(struct lock* lock) {
+  ASSERT(intr_get_level() == INTR_OFF);
+
+  if (lock->holder != NULL) {
+    list_remove(&lock->holder_elem);
+    thread_recompute_priority(lock->holder);
+    lock->holder = NULL;
+  }
+
+  while (!list_empty(&lock->semaphore.waiters)) {
+    struct list_elem* e = list_pop_front(&lock->semaphore.waiters);
+    struct thread* w = list_entry(e, struct thread, elem);
+    w->waiting_on_lock = NULL;
+  }
+
+  free(lock);
+}
+
+/* Detaches a user semaphore's waiters and frees it. Must be called with
+   interrupts off. Waiters are left BLOCKED; semaphores carry no donation
+   state, so no holder/locks_held bookkeeping is needed. */
+static void release_user_sema(struct semaphore* sema) {
+  ASSERT(intr_get_level() == INTR_OFF);
+
+  while (!list_empty(&sema->waiters)) {
+    struct list_elem* e = list_pop_front(&sema->waiters);
+    struct thread* w = list_entry(e, struct thread, elem);
+    w->waiting_on_lock = NULL;
+  }
+
+  free(sema);
+}
+
 /* Free the current process's resources. */
 void process_exit(void) {
   struct thread* cur = thread_current();
@@ -515,16 +553,20 @@ void process_exit(void) {
     free(tsn);
   }
 
+  enum intr_level old_level = intr_disable();
   for (size_t i = 0; i < USER_LOCK_SIZE; i++) {
     if (cur->pcb->user_locks[i] != NULL) {
-      free(cur->pcb->user_locks[i]);
+      release_user_lock(cur->pcb->user_locks[i]);
+      cur->pcb->user_locks[i] = NULL;
     }
   }
   for (size_t i = 0; i < USER_SEMA_SIZE; i++) {
     if (cur->pcb->user_semas[i] != NULL) {
-      free(cur->pcb->user_semas[i]);
+      release_user_sema(cur->pcb->user_semas[i]);
+      cur->pcb->user_semas[i] = NULL;
     }
   }
+  intr_set_level(old_level);
 
   if (cur->pcb->exec_file != NULL)
     file_close(cur->pcb->exec_file);
