@@ -9,9 +9,6 @@
 // These defines will be used in Project 2: Multithreading
 #define MAX_STACK_PAGES (1 << 11)
 #define MAX_THREADS 127
-#define THREAD_STACK_SLOT_SIZE (1 << 20)
-#define USER_LOCK_SIZE 256
-#define USER_SEMA_SIZE 256
 
 /* PIDs and TIDs are the same type. PID should be
    the TID of the main thread of the process */
@@ -23,7 +20,7 @@ typedef void (*stub_fun)(pthread_fun, void*);
 
 struct fd_table {
   struct file* entries[128];
-  bool inherited[128]; /* true if fd was inherited from parent via fork */
+  bool inherited[128];     /* true if fd was inherited from parent via fork */
   int next_fd;
 };
 
@@ -53,15 +50,6 @@ struct process {
   struct child_status* my_status; /* 指向本进程在父进程 children 列表中的档案 */
   struct fd_table* fd_table;      /* 文件描述符表 */
   struct file* exec_file;         /* 可执行文件，用于 ROX 保护 */
-  struct list thread_statuses;    /* 进程中的所有线程 */
-
-  bool exiting;                      /* true once any thread triggered process exit. */
-  int exit_code;                     /* Process exit code (set once). */
-  bool stack_slot_used[MAX_THREADS]; /* pthread stack slot allocation bitmap. */
-  struct lock pagedir_lock;          /* Serializes pthread stack page table edits. */
-
-  struct lock* user_locks[USER_LOCK_SIZE];      // 索引 → 内核 lock 指针
-  struct semaphore* user_semas[USER_SEMA_SIZE]; // 同理
 };
 
 void userprog_init(void);

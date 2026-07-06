@@ -1,13 +1,13 @@
-// #include "user/syscall.h"
+#include "userprog/syscall.h"
 #include "devices/shutdown.h"
 #include "filesys/filesys.h"
 #include "threads/interrupt.h"
 #include "threads/malloc.h"
-#include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "userprog/pagedir.h"
 #include "userprog/process.h"
+#include "threads/synch.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <syscall-nr.h>
@@ -18,7 +18,7 @@ static void check_valid_bytes(const void* vaddr, size_t size);
 static size_t safe_strlen(const void* vaddr);
 void exit_process(int status);
 
-struct lock filesys_lock;
+static struct lock filesys_lock;
 
 void syscall_init(void) {
   intr_register_int(0x30, 3, INTR_ON, syscall_handler, "syscall");
@@ -28,36 +28,18 @@ void syscall_init(void) {
 void exit_process(int status) {
   struct process* pcb = thread_current()->pcb;
 
-  if (pcb == NULL) {
-    thread_exit();
-    NOT_REACHED();
-  }
+  // 1. 打印 Pintos 测试系统强制要求的退出信息
+  // printf("%s: exit(%d)\n", pcb->process_name, status);
 
-  /* The first thread to call exit_process announces the process exit
-     (prints the exit line and wakes the parent's wait()) exactly once.
-     This must happen immediately -- even if sibling threads are still
-     alive (e.g. one blocked in pthread_exit's join-wait loop on this
-     very thread) -- otherwise the parent could block forever. Shared
-     resource teardown is still deferred to the last surviving thread
-     inside process_exit(). */
-  enum intr_level old_level = intr_disable();
-  bool first = !pcb->exiting;
-  if (first) {
-    pcb->exiting = true;
-    pcb->exit_code = status;
-  }
-  intr_set_level(old_level);
-
-  /* Announce with interrupts enabled so we never deadlock on the
-     console lock (a preempted writer could be holding it). Only the
-     first caller announces; later callers see pcb->exiting and skip. */
-  if (first && pcb->my_status != NULL) {
-    printf("%s: exit(%d)\n", pcb->process_name, status);
+  // 2. 如果我有父进程（my_status 不为 NULL），更新我的遗产
+  if (pcb->my_status != NULL) {
     pcb->my_status->exit_status = status;
     pcb->my_status->is_alive = false;
+    // 唤醒可能正在 wait 我的父进程
     sema_up(&pcb->my_status->wait_sema);
   }
 
+  // 3. 将退出状态返回给内核并真正回收资源
   process_exit();
 }
 
@@ -94,118 +76,7 @@ static size_t safe_strlen(const void* vaddr) {
   }
 }
 
-static bool syscall_lock_init(char* lock) {
-  if (lock == NULL)
-    return false;
-  struct process* pcb = thread_current()->pcb;
-  uint32_t idx = -1;
-
-  for (size_t i = 0; i < USER_LOCK_SIZE; i++) {
-    if (pcb->user_locks[i] == NULL) {
-      idx = i;
-      break;
-    }
-  }
-  if (idx == -1) {
-    return false;
-  }
-
-  struct lock* kernel_lock = malloc(sizeof(struct lock));
-  if (kernel_lock == NULL) {
-    return false;
-  }
-  lock_init(kernel_lock);
-  pcb->user_locks[idx] = kernel_lock;
-  *lock = (char)idx;
-  return true;
-}
-
-static bool syscall_lock_acquire(char* lock) {
-  struct process* pcb = thread_current()->pcb;
-  unsigned char idx = *(unsigned char*)lock;
-  struct lock* kernel_lock = pcb->user_locks[idx];
-
-  if (kernel_lock == NULL || lock_held_by_current_thread(kernel_lock)) {
-    return false;
-  }
-
-  lock_acquire(kernel_lock);
-  return true;
-}
-
-static bool syscall_lock_release(char* lock) {
-  struct process* pcb = thread_current()->pcb;
-  unsigned char idx = *(unsigned char*)lock;
-  struct lock* kernel_lock = pcb->user_locks[idx];
-
-  if (kernel_lock == NULL || !lock_held_by_current_thread(kernel_lock)) {
-    return false;
-  }
-
-  lock_release(kernel_lock);
-  return true;
-}
-
-static bool syscall_sema_init(char* sema, int val) {
-  if (val < 0)
-    return false;
-  if (sema == NULL)
-    return false;
-  struct process* pcb = thread_current()->pcb;
-  uint32_t idx = -1;
-
-  for (size_t i = 0; i < USER_SEMA_SIZE; i++) {
-    if (pcb->user_semas[i] == NULL) {
-      idx = i;
-      break;
-    }
-  }
-  if (idx == -1) {
-    return false;
-  }
-
-  struct semaphore* kernel_sema = malloc(sizeof(struct semaphore));
-  if (kernel_sema == NULL) {
-    return false;
-  }
-  sema_init(kernel_sema, val);
-  pcb->user_semas[idx] = kernel_sema;
-  *sema = (char)idx;
-  return true;
-}
-
-static bool syscall_sema_down(char* sema) {
-  struct process* pcb = thread_current()->pcb;
-  unsigned char idx = *(unsigned char*)sema;
-  struct semaphore* kernel_sema = pcb->user_semas[idx];
-
-  if (kernel_sema == NULL) {
-    return false;
-  }
-  sema_down(kernel_sema);
-  return true;
-}
-
-static bool syscall_sema_up(char* sema) {
-  struct process* pcb = thread_current()->pcb;
-  unsigned char idx = *(unsigned char*)sema;
-  struct semaphore* kernel_sema = pcb->user_semas[idx];
-
-  if (kernel_sema == NULL) {
-    return false;
-  }
-  sema_up(kernel_sema);
-  return true;
-}
-
 static void syscall_handler(struct intr_frame* f UNUSED) {
-  /* If our process is already exiting (another thread triggered exit),
-     die immediately rather than touching user memory or shared state. */
-  if (thread_current()->pcb != NULL && thread_current()->pcb->exiting) {
-    process_exit();
-    NOT_REACHED();
-  }
-
   check_valid_bytes(f->esp, sizeof(uint32_t));
   uint32_t* args = ((uint32_t*)f->esp);
 
@@ -218,260 +89,174 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
 
   /* printf("System call number: %d\n", args[0]); */
 
-  switch (args[0]) {
-    case SYS_EXIT: {
-      check_valid_bytes(args, 2 * sizeof(uint32_t));
-      f->eax = args[1];
-      exit_process((int)args[1]);
-      break;
-    }
-    case SYS_WRITE: {
-      check_valid_bytes(args, 4 * sizeof(uint32_t));
-      int fd = (int)args[1];
-      const void* buffer = (const void*)args[2];
-      unsigned size = (unsigned)args[3];
+  if (args[0] == SYS_EXIT) {
+    check_valid_bytes(args, 2 * sizeof(uint32_t));
+    f->eax = args[1];
+    exit_process((int)args[1]);
+  } else if (args[0] == SYS_WRITE) {
+    check_valid_bytes(args, 4 * sizeof(uint32_t));
+    int fd = (int)args[1];
+    const void* buffer = (const void*)args[2];
+    unsigned size = (unsigned)args[3];
+
+    if (fd == 1) {
       check_valid_bytes(buffer, size);
-
-      if (fd == 1) {
-        putbuf(buffer, size);
-        f->eax = size;
-      } else {
-        lock_acquire(&filesys_lock);
-        struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
-        if (file_ptr == NULL) {
-          lock_release(&filesys_lock);
-          f->eax = -1;
-        } else {
-          int n = file_write(file_ptr, buffer, size);
-          lock_release(&filesys_lock);
-          f->eax = n;
-        }
-      }
-      break;
-    }
-    case SYS_PRACTICE: {
-      check_valid_bytes(args, 2 * sizeof(uint32_t));
-      f->eax = args[1] + 1;
-      break;
-    }
-    case SYS_HALT: {
-      shutdown_power_off();
-      break;
-    }
-    case SYS_EXEC: {
-      check_valid_bytes(args, 2 * sizeof(uint32_t));
-      const char* cmd_line = (const char*)args[1];
-      check_valid_bytes(cmd_line, safe_strlen(cmd_line) + 1);
-      pid_t child_pid = process_execute(cmd_line);
-
-      if (child_pid == TID_ERROR) {
-        f->eax = -1;
-      } else {
-        struct child_status* child_status = get_child_by_pid(child_pid);
-        sema_down(&child_status->load_sema);
-        if (!child_status->load_success) {
-          f->eax = -1;
-        } else {
-          f->eax = child_pid;
-        }
-      }
-      break;
-    }
-    case SYS_WAIT: {
-      check_valid_bytes(args, 2 * sizeof(uint32_t));
-      struct child_status* child_status = get_child_by_pid((pid_t)args[1]);
-
-      if (child_status == NULL) {
-        f->eax = -1;
-        break;
-      }
-      if (child_status->is_waited) {
-        f->eax = -1;
-        break;
-      }
-
-      if (child_status->is_alive) {
-        sema_down(&child_status->wait_sema);
-      }
-
-      child_status->is_waited = true;
-      f->eax = child_status->exit_status;
-      list_remove(&child_status->elem);
-      free(child_status);
-      break;
-    }
-    case SYS_FORK: {
-      f->eax = process_fork(f);
-      break;
-    }
-    case SYS_CREATE: {
-      check_valid_bytes(args, 2 * sizeof(uint32_t));
-      const char* file = (const char*)args[1];
-      unsigned initial_size = (unsigned)args[2];
-      check_valid_bytes(file, safe_strlen(file) + 1);
-      lock_acquire(&filesys_lock);
-      f->eax = filesys_create(file, initial_size);
-      lock_release(&filesys_lock);
-      break;
-    }
-    case SYS_REMOVE: {
-      check_valid_bytes(args, 2 * sizeof(uint32_t));
-      const char* file = (const char*)args[1];
-      check_valid_bytes(file, safe_strlen(file) + 1);
-      lock_acquire(&filesys_lock);
-      f->eax = filesys_remove(file);
-      lock_release(&filesys_lock);
-      break;
-    }
-    case SYS_OPEN: {
-      check_valid_bytes(args, 2 * sizeof(uint32_t));
-      const char* file = (const char*)args[1];
-      check_valid_bytes(file, safe_strlen(file) + 1);
-      lock_acquire(&filesys_lock);
-      struct file* file_ptr = filesys_open(file);
-      if (file_ptr == NULL) {
-        lock_release(&filesys_lock);
-        f->eax = -1;
-      } else {
-        int result = store_fd(thread_current()->pcb, file_ptr, -1);
-        lock_release(&filesys_lock);
-        f->eax = result;
-      }
-      break;
-    }
-    case SYS_FILESIZE: {
-      check_valid_bytes(args, 2 * sizeof(uint32_t));
-      int fd = (int)args[1];
+      putbuf(buffer, size);
+      f->eax = size;
+    } else {
       lock_acquire(&filesys_lock);
       struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
       if (file_ptr == NULL) {
         lock_release(&filesys_lock);
         f->eax = -1;
       } else {
-        off_t sz = file_length(file_ptr);
-        lock_release(&filesys_lock);
-        f->eax = sz;
-      }
-      break;
-    }
-    case SYS_READ: {
-      check_valid_bytes(args, 4 * sizeof(uint32_t));
-      int fd = (int)args[1];
-      void* buffer = (void*)args[2];
-      unsigned size = (unsigned)args[3];
-      check_valid_bytes(buffer, size);
-      lock_acquire(&filesys_lock);
-      struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
-      if (file_ptr == NULL) {
-        lock_release(&filesys_lock);
-        f->eax = -1;
-      } else {
-        int n = file_read(file_ptr, buffer, size);
+        check_valid_bytes(buffer, size);
+        int n = file_write(file_ptr, buffer, size);
         lock_release(&filesys_lock);
         f->eax = n;
       }
-      break;
     }
-    case SYS_SEEK: {
-      check_valid_bytes(args, 3 * sizeof(uint32_t));
-      int fd = (int)args[1];
-      unsigned position = (unsigned)args[2];
-      lock_acquire(&filesys_lock);
-      struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
-      if (file_ptr != NULL) {
-        file_seek(file_ptr, position);
-      }
-      lock_release(&filesys_lock);
-      break;
-    }
-    case SYS_TELL: {
-      check_valid_bytes(args, 2 * sizeof(uint32_t));
-      int fd = (int)args[1];
-      lock_acquire(&filesys_lock);
-      struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
-      if (file_ptr == NULL) {
-        lock_release(&filesys_lock);
+  } else if (args[0] == SYS_PRACTICE) {
+    check_valid_bytes(args, 2 * sizeof(uint32_t));
+    f->eax = args[1] + 1;
+  } else if (args[0] == SYS_HALT) {
+    shutdown_power_off();
+  } else if (args[0] == SYS_EXEC) {
+    check_valid_bytes(args, 2 * sizeof(uint32_t));
+    const char* cmd_line = (const char*)args[1];
+    check_valid_bytes(cmd_line, safe_strlen(cmd_line) + 1);
+    pid_t child_pid = process_execute(cmd_line);
+
+    if (child_pid == TID_ERROR) {
+      f->eax = -1;
+    } else {
+      struct child_status* child_status = get_child_by_pid(child_pid);
+      sema_down(&child_status->load_sema);
+      if (!child_status->load_success) {
         f->eax = -1;
       } else {
-        off_t pos = file_tell(file_ptr);
-        lock_release(&filesys_lock);
-        f->eax = pos;
+        f->eax = child_pid;
       }
-      break;
     }
-    case SYS_CLOSE: {
-      check_valid_bytes(args, 2 * sizeof(uint32_t));
-      int fd = (int)args[1];
-      struct process* pcb = thread_current()->pcb;
-      lock_acquire(&filesys_lock);
-      struct file* file_ptr = (struct file*)get_kernel_fd(pcb, fd);
-      /* Skip file_close for inherited fds to avoid double-close on shared struct file */
-      if (file_ptr != NULL) {
-        bool inherited =
-            (fd >= 0 && fd < 128 && pcb->fd_table != NULL && pcb->fd_table->inherited[fd]);
-        if (!inherited)
-          file_close(file_ptr);
-      }
-      remove_fd(pcb, fd);
+  } else if (args[0] == SYS_WAIT) {
+    check_valid_bytes(args, 2 * sizeof(uint32_t));
+    struct child_status* child_status = get_child_by_pid((pid_t)args[1]);
+
+    if (child_status == NULL) {
+      f->eax = -1;
+      return;
+    }
+    if (child_status->is_waited) {
+      f->eax = -1;
+      return;
+    }
+
+    if (child_status->is_alive) {
+      sema_down(&child_status->wait_sema);
+    }
+
+    child_status->is_waited = true;
+    f->eax = child_status->exit_status;
+    list_remove(&child_status->elem);
+    free(child_status);
+  } else if (args[0] == SYS_FORK) {
+    f->eax = process_fork(f);
+  } else if (args[0] == SYS_CREATE) {
+    check_valid_bytes(args, 2 * sizeof(uint32_t));
+    const char* file = (const char*)args[1];
+    unsigned initial_size = (unsigned)args[2];
+    check_valid_bytes(file, safe_strlen(file) + 1);
+    lock_acquire(&filesys_lock);
+    f->eax = filesys_create(file, initial_size);
+    lock_release(&filesys_lock);
+  } else if (args[0] == SYS_REMOVE) {
+    check_valid_bytes(args, 2 * sizeof(uint32_t));
+    const char* file = (const char*)args[1];
+    check_valid_bytes(file, safe_strlen(file) + 1);
+    lock_acquire(&filesys_lock);
+    f->eax = filesys_remove(file);
+    lock_release(&filesys_lock);
+  } else if (args[0] == SYS_OPEN) {
+    check_valid_bytes(args, 2 * sizeof(uint32_t));
+    const char* file = (const char*)args[1];
+    check_valid_bytes(file, safe_strlen(file) + 1);
+    lock_acquire(&filesys_lock);
+    struct file* file_ptr = filesys_open(file);
+    if (file_ptr == NULL) {
       lock_release(&filesys_lock);
-      break;
+      f->eax = -1;
+    } else {
+      int result = store_fd(thread_current()->pcb, file_ptr, -1);
+      lock_release(&filesys_lock);
+      f->eax = result;
     }
-    case SYS_PT_CREATE: {
-      check_valid_bytes(args, 4 * sizeof(uint32_t));
-      stub_fun sfun = (stub_fun)args[1];
-      pthread_fun tfun = (pthread_fun)args[2];
-      const void* arg = (const void*)args[3];
-      check_valid_ptr(sfun);
-      check_valid_ptr(tfun);
-      f->eax = pthread_execute(sfun, tfun, (void*)arg);
-      break;
+  } else if (args[0] == SYS_FILESIZE) {
+    check_valid_bytes(args, 2 * sizeof(uint32_t));
+    int fd = (int)args[1];
+    lock_acquire(&filesys_lock);
+    struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
+    if (file_ptr == NULL) {
+      lock_release(&filesys_lock);
+      f->eax = -1;
+    } else {
+      off_t sz = file_length(file_ptr);
+      lock_release(&filesys_lock);
+      f->eax = sz;
     }
-    case SYS_PT_EXIT: {
-      pthread_exit();
-      break;
+  } else if (args[0] == SYS_READ) {
+    check_valid_bytes(args, 4 * sizeof(uint32_t));
+    int fd = (int)args[1];
+    void* buffer = (void*)args[2];
+    unsigned size = (unsigned)args[3];
+    check_valid_bytes(buffer, size);
+    lock_acquire(&filesys_lock);
+    struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
+    if (file_ptr == NULL) {
+      lock_release(&filesys_lock);
+      f->eax = -1;
+    } else {
+      int n = file_read(file_ptr, buffer, size);
+      lock_release(&filesys_lock);
+      f->eax = n;
     }
-    case SYS_PT_JOIN: {
-      check_valid_bytes(args, 2 * sizeof(uint32_t));
-      f->eax = pthread_join((tid_t)args[1]);
-      break;
+  } else if (args[0] == SYS_SEEK) {
+    check_valid_bytes(args, 3 * sizeof(uint32_t));
+    int fd = (int)args[1];
+    unsigned position = (unsigned)args[2];
+    lock_acquire(&filesys_lock);
+    struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
+    if (file_ptr != NULL) {
+      file_seek(file_ptr, position);
     }
-    case SYS_LOCK_INIT: {
-      check_valid_bytes(args, 2 * sizeof(uint32_t));
-      f->eax = syscall_lock_init((char*)args[1]);
-      break;
+    lock_release(&filesys_lock);
+  } else if (args[0] == SYS_TELL) {
+    check_valid_bytes(args, 2 * sizeof(uint32_t));
+    int fd = (int)args[1];
+    lock_acquire(&filesys_lock);
+    struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
+    if (file_ptr == NULL) {
+      lock_release(&filesys_lock);
+      f->eax = -1;
+    } else {
+      off_t pos = file_tell(file_ptr);
+      lock_release(&filesys_lock);
+      f->eax = pos;
     }
-    case SYS_LOCK_ACQUIRE: {
-      check_valid_bytes(args, 2 * sizeof(uint32_t));
-      f->eax = syscall_lock_acquire((char*)args[1]);
-      break;
+  } else if (args[0] == SYS_CLOSE) {
+    check_valid_bytes(args, 2 * sizeof(uint32_t));
+    int fd = (int)args[1];
+    struct process* pcb = thread_current()->pcb;
+    lock_acquire(&filesys_lock);
+    struct file* file_ptr = (struct file*)get_kernel_fd(pcb, fd);
+    /* Skip file_close for inherited fds to avoid double-close on shared struct file */
+    if (file_ptr != NULL) {
+      bool inherited = (fd >= 0 && fd < 128
+                        && pcb->fd_table != NULL
+                        && pcb->fd_table->inherited[fd]);
+      if (!inherited)
+        file_close(file_ptr);
     }
-    case SYS_LOCK_RELEASE: {
-      check_valid_bytes(args, 2 * sizeof(uint32_t));
-      f->eax = syscall_lock_release((char*)args[1]);
-      break;
-    }
-    case SYS_SEMA_INIT: {
-      check_valid_bytes(args, 3 * sizeof(uint32_t));
-      f->eax = syscall_sema_init((char*)args[1], (int)args[2]);
-      break;
-    }
-    case SYS_SEMA_DOWN: {
-      check_valid_bytes(args, 2 * sizeof(uint32_t));
-      f->eax = syscall_sema_down((char*)args[1]);
-      break;
-    }
-    case SYS_SEMA_UP: {
-      check_valid_bytes(args, 2 * sizeof(uint32_t));
-      f->eax = syscall_sema_up((char*)args[1]);
-      break;
-    }
-    case SYS_GET_TID: {
-      f->eax = thread_current()->tid;
-      break;
-    }
-    default: {
-      printf("Unimplemented system call: %d\n", (int)args[0]);
-      break;
-    }
+    remove_fd(pcb, fd);
+    lock_release(&filesys_lock);
   }
 }

@@ -1,11 +1,11 @@
 #ifndef THREADS_THREAD_H
 #define THREADS_THREAD_H
 
-#include "threads/fixed-point.h"
-#include "threads/synch.h"
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include "threads/synch.h"
+#include "threads/fixed-point.h"
 
 /* States in a thread's life cycle. */
 enum thread_status {
@@ -18,23 +18,12 @@ enum thread_status {
 /* Thread identifier type.
    You can redefine this to whatever type you like. */
 typedef int tid_t;
-#define TID_ERROR ((tid_t) - 1) /* Error value for tid_t. */
+#define TID_ERROR ((tid_t)-1) /* Error value for tid_t. */
 
 /* Thread priorities. */
 #define PRI_MIN 0      /* Lowest priority. */
 #define PRI_DEFAULT 31 /* Default priority. */
 #define PRI_MAX 63     /* Highest priority. */
-
-#ifdef USERPROG
-struct thread_status_node {
-  tid_t tid;                  // 目标线程的 TID
-  int exit_code;              // 退出状态码
-  bool is_exited;             // 是否已经退出（僵尸状态）
-  bool is_joined;             // 当前线程是否已经 join
-  struct semaphore join_sema; // 用于 join 的信号量
-  struct list_elem elem;      // 挂在 PCB 的 thread_statuses
-};
-#endif
 
 /* A kernel thread or user process.
 
@@ -99,24 +88,14 @@ struct thread {
   char name[16];             /* Name (for debugging purposes). */
   uint8_t* stack;            /* Saved stack pointer. */
   int priority;              /* Priority. */
-  int effective_priority;
-  struct list_elem allelem; /* List element for all threads list. */
+  struct list_elem allelem;  /* List element for all threads list. */
 
   /* Shared between thread.c and synch.c. */
   struct list_elem elem; /* List element. */
-  struct list locks_held;
-  struct lock* waiting_on_lock;
-
-  int64_t wakeup_tick;
-  int64_t fair_pass;
 
 #ifdef USERPROG
   /* Owned by process.c. */
   struct process* pcb; /* Process control block if this thread is a userprog */
-  struct thread_status_node*
-      status_node; /* Pointer to this thread's status node in the parent process's list */
-  void* stack_upage; /* User VA of this pthread's stack page (NULL if not a pthread). */
-  int stack_slot;     /* Per-process stack slot index, or -1 if not a pthread. */
 #endif
 
   /* Owned by thread.c. */
@@ -164,10 +143,6 @@ void thread_foreach(thread_action_func*, void*);
 
 int thread_get_priority(void);
 void thread_set_priority(int);
-bool thread_priority_less(const struct list_elem* a_, const struct list_elem* b_, void* aux UNUSED);
-bool thread_pass_less(const struct list_elem* a_, const struct list_elem* b_, void* aux UNUSED);
-void thread_recompute_priority(struct thread *t);
-void thread_yield_if_not_highest(void);
 
 int thread_get_nice(void);
 void thread_set_nice(int);

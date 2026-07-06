@@ -1,12 +1,12 @@
 #include "devices/timer.h"
-#include "devices/pit.h"
-#include "threads/interrupt.h"
-#include "threads/synch.h"
-#include "threads/thread.h"
 #include <debug.h>
 #include <inttypes.h>
 #include <round.h>
 #include <stdio.h>
+#include "devices/pit.h"
+#include "threads/interrupt.h"
+#include "threads/synch.h"
+#include "threads/thread.h"
 
 /* See [8254] for hardware details of the 8254 timer chip. */
 
@@ -29,7 +29,6 @@ static bool too_many_loops(unsigned loops);
 static void busy_wait(int64_t loops);
 static void real_time_sleep(int64_t num, int32_t denom);
 static void real_time_delay(int64_t num, int32_t denom);
-static void check_sleeping_thread(struct thread* t, void* aux UNUSED);
 
 /* Sets up the timer to interrupt TIMER_FREQ times per second,
    and registers the corresponding interrupt. */
@@ -80,12 +79,8 @@ void timer_sleep(int64_t ticks) {
   int64_t start = timer_ticks();
 
   ASSERT(intr_get_level() == INTR_ON);
-  if (ticks <= 0)
-    return;
-  enum intr_level old_level = intr_disable();
-  thread_current()->wakeup_tick = start + ticks;
-  thread_block();
-  intr_set_level(old_level);
+  while (timer_elapsed(start) < ticks)
+    thread_yield();
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -134,8 +129,6 @@ void timer_print_stats(void) { printf("Timer: %" PRId64 " ticks\n", timer_ticks(
 static void timer_interrupt(struct intr_frame* args UNUSED) {
   ticks++;
   thread_tick();
-
-  thread_foreach(check_sleeping_thread, NULL);
 }
 
 /* Returns true if LOOPS iterations waits for more than one timer
@@ -196,12 +189,4 @@ static void real_time_delay(int64_t num, int32_t denom) {
      the possibility of overflow. */
   ASSERT(denom % 1000 == 0);
   busy_wait(loops_per_tick * num / 1000 * TIMER_FREQ / (denom / 1000));
-}
-
-static void check_sleeping_thread(struct thread* t, void* aux UNUSED) {
-  if (t->status == THREAD_BLOCKED && t->wakeup_tick > 0
-      && timer_ticks() >= t->wakeup_tick) {
-    t->wakeup_tick = 0;
-    thread_unblock(t);
-  }
 }
