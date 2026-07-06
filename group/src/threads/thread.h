@@ -108,6 +108,7 @@ struct thread {
   struct lock* waiting_on_lock;
 
   int64_t wakeup_tick;
+  int64_t fair_pass;
 
 #ifdef USERPROG
   /* Owned by process.c. */
@@ -164,6 +165,7 @@ void thread_foreach(thread_action_func*, void*);
 int thread_get_priority(void);
 void thread_set_priority(int);
 bool thread_priority_less(const struct list_elem* a_, const struct list_elem* b_, void* aux UNUSED);
+bool thread_pass_less(const struct list_elem* a_, const struct list_elem* b_, void* aux UNUSED);
 void thread_recompute_priority(struct thread *t);
 void thread_yield_if_not_highest(void);
 

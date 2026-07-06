@@ -19,12 +19,16 @@
    Used to detect stack overflow.  See the big comment at the top
    of thread.h for details. */
 #define THREAD_MAGIC 0xcd6abf4b
+#define STRIDE_BASE (INT32_MAX >> 1)
+#define STRIDE_ONE (1 >> 5)
 
 /* List of processes in THREAD_READY state, that is, processes
    that are ready to run but not actually running. */
 static struct list fifo_ready_list;
 
 static struct list prio_ready_list;
+
+static struct list fair_ready_list;
 
 /* List of all processes.  Processes are added to this list
    when they are first scheduled and removed when they exit. */
@@ -73,6 +77,7 @@ static struct thread* thread_schedule_prio(void);
 static struct thread* thread_schedule_fair(void);
 static struct thread* thread_schedule_mlfqs(void);
 static struct thread* thread_schedule_reserved(void);
+static int64_t thread_stride(int priority);
 
 /* Determines which scheduler the kernel should use.
    Controlled by the kernel command-line options
@@ -111,6 +116,7 @@ void thread_init(void) {
   lock_init(&tid_lock);
   list_init(&fifo_ready_list);
   list_init(&prio_ready_list);
+  list_init(&fair_ready_list);
   list_init(&all_list);
 
   /* Set up a thread structure for the running thread. */
@@ -252,6 +258,8 @@ static void thread_enqueue(struct thread* t) {
     list_push_back(&fifo_ready_list, &t->elem);
   else if (active_sched_policy == SCHED_PRIO)
     list_push_back(&prio_ready_list, &t->elem);
+  else if (active_sched_policy == SCHED_FAIR)
+    list_push_back(&fair_ready_list, &t->elem);
   else
     PANIC("Unimplemented scheduling policy value: %d", active_sched_policy);
 }
@@ -273,6 +281,12 @@ void thread_unblock(struct thread* t) {
   ASSERT(t->status == THREAD_BLOCKED);
   thread_enqueue(t);
   t->status = THREAD_READY;
+  if (active_sched_policy == SCHED_FAIR && t->fair_pass == 0 && !list_empty(&fair_ready_list)) {
+    struct list_elem* e = list_min(&fair_ready_list, thread_pass_less, NULL);
+    struct thread* target = list_entry(e, struct thread, elem);
+    t->fair_pass = target->fair_pass;
+  }
+
   intr_set_level(old_level);
 }
 
@@ -346,9 +360,14 @@ void thread_foreach(thread_action_func* func, void* aux) {
 /* Sets the current thread's priority to NEW_PRIORITY. */
 void thread_set_priority(int new_priority) {
   enum intr_level old_level = intr_disable();
+  int old_priority = thread_current()->priority;
   thread_current()->priority = new_priority;
   thread_recompute_priority(thread_current());
-  thread_yield_if_not_highest();
+  if (active_sched_policy == SCHED_FAIR && new_priority < old_priority) {
+    thread_yield();
+  } else if (active_sched_policy == SCHED_PRIO) {
+    thread_yield_if_not_highest();
+  }
   intr_set_level(old_level);
 }
 
@@ -451,6 +470,7 @@ static void init_thread(struct thread* t, const char* name, int priority) {
   t->priority = priority;
   t->effective_priority = priority;
   t->pcb = NULL;
+  t->fair_pass = 0;
   t->magic = THREAD_MAGIC;
 
   list_init(&t->locks_held);
@@ -492,7 +512,14 @@ static struct thread* thread_schedule_prio(void) {
 
 /* Fair priority scheduler */
 static struct thread* thread_schedule_fair(void) {
-  PANIC("Unimplemented scheduler policy: \"-sched=fair\"");
+  if (!list_empty(&fair_ready_list)) {
+    struct list_elem* e = list_min(&fair_ready_list, thread_pass_less, NULL);
+    struct thread* t = list_entry(e, struct thread, elem);
+    list_remove(e);
+    t->fair_pass += thread_stride(t->priority);
+    return t;
+  } else
+    return idle_thread;
 }
 
 /* Multi-level feedback queue scheduler */
@@ -602,6 +629,13 @@ bool thread_priority_less(const struct list_elem* a_, const struct list_elem* b_
   return a->effective_priority < b->effective_priority;
 }
 
+bool thread_pass_less(const struct list_elem* a_, const struct list_elem* b_, void* aux UNUSED) {
+  struct thread* a = list_entry(a_, struct thread, elem);
+  struct thread* b = list_entry(b_, struct thread, elem);
+
+  return a->fair_pass < b->fair_pass;
+}
+
 void thread_recompute_priority(struct thread* t) {
   ASSERT(intr_get_level() == INTR_OFF);
 
@@ -635,3 +669,5 @@ void thread_yield_if_not_highest() {
     }
   }
 }
+
+static int64_t thread_stride(int priority) { return STRIDE_BASE / (priority + 20); }
