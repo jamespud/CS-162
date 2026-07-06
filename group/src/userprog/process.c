@@ -21,6 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+extern struct lock filesys_lock;
+
 static thread_func start_process NO_RETURN;
 static thread_func start_pthread NO_RETURN;
 static bool load(const char* file_name, void (**eip)(void), void** esp);
@@ -433,6 +435,8 @@ static void start_fork(void* args_) {
   new_pcb->main_thread = t;
   list_init(&new_pcb->children);
   list_init(&new_pcb->thread_statuses);
+  memset(new_pcb->user_locks, 0, sizeof(new_pcb->user_locks));
+  memset(new_pcb->user_semas, 0, sizeof(new_pcb->user_semas));
 
   /* Child gets its own exec_file handle (independent deny_write refcounting) */
   if (fargs->parent_exec_file != NULL)
@@ -522,6 +526,14 @@ static void release_user_sema(struct semaphore* sema) {
   free(sema);
 }
 
+/* Helper for process_exit: counts how many threads share the current
+   thread's PCB.  Called via thread_foreach() with interrupts off. */
+static void count_pcb_threads(struct thread* t, void* aux) {
+  int* count = aux;
+  if (t->pcb == thread_current()->pcb)
+    (*count)++;
+}
+
 /* Free the current process's resources. */
 void process_exit(void) {
   struct thread* cur = thread_current();
@@ -581,28 +593,39 @@ void process_exit(void) {
   }
 
   /* Destroy the current process's page directory and switch back
-     to the kernel-only page directory. */
-  pd = cur->pcb->pagedir;
-  if (pd != NULL) {
-    /* Correct ordering here is crucial.  We must set
-         cur->pcb->pagedir to NULL before switching page directories,
-         so that a timer interrupt can't switch back to the
-         process page directory.  We must activate the base page
-         directory before destroying the process's page
-         directory, or our active page directory will be one
-         that's been freed (and cleared). */
-    cur->pcb->pagedir = NULL;
-    pagedir_activate(NULL);
-    pagedir_destroy(pd);
+     to the kernel-only page directory.
+     If other threads still share this PCB (e.g. worker threads that
+     have not yet exited), skip destruction to avoid use-after-free
+     when those threads are later scheduled. */
+  {
+    int share_count = 0;
+    enum intr_level old = intr_disable();
+    thread_foreach(count_pcb_threads, &share_count);
+    if (share_count <= 1) {
+      pd = cur->pcb->pagedir;
+      if (pd != NULL) {
+        cur->pcb->pagedir = NULL;
+        pagedir_activate(NULL);
+        pagedir_destroy(pd);
+      }
+    }
+    intr_set_level(old);
   }
 
-  /* Free the PCB of this process and kill this thread
-     Avoid race where PCB is freed before t->pcb is set to NULL
-     If this happens, then an unfortuantely timed timer interrupt
-     can try to activate the pagedir, but it is now freed memory */
-  struct process* pcb_to_free = cur->pcb;
-  cur->pcb = NULL;
-  free(pcb_to_free);
+  /* Free the PCB of this process and kill this thread.
+     Avoid race where PCB is freed before t->pcb is set to NULL.
+     If other threads share this PCB, skip the free as well. */
+  {
+    int share_count = 0;
+    enum intr_level old = intr_disable();
+    thread_foreach(count_pcb_threads, &share_count);
+    if (share_count <= 1) {
+      struct process* pcb_to_free = cur->pcb;
+      cur->pcb = NULL;
+      free(pcb_to_free);
+    }
+    intr_set_level(old);
+  }
 
   thread_exit();
 }
@@ -701,6 +724,10 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
   bool success = false;
   int i;
 
+  /* Hold filesys_lock throughout ELF loading so that concurrent
+     exec() calls do not corrupt each other's filesystem reads. */
+  lock_acquire(&filesys_lock);
+
   /* Allocate and activate page directory. */
   t->pcb->pagedir = pagedir_create();
   if (t->pcb->pagedir == NULL)
@@ -783,6 +810,7 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
 
 done:
   /* We arrive here whether the load is successful or not. */
+  lock_release(&filesys_lock);
   file_close(file);
   return success;
 }
@@ -1047,7 +1075,7 @@ static void start_pthread(void* exec_ UNUSED) {
   bool success = setup_thread(exec_args->sfun, exec_args->tfun, exec_args->arg, &if_.eip, &if_.esp);
   free(exec_args);
   if (!success) {
-    thread_exit();
+    pthread_exit();
     NOT_REACHED();
   }
 
@@ -1115,6 +1143,20 @@ void pthread_exit(void) {
   if (tsn != NULL) {
     tsn->is_exited = true;
     sema_up(&tsn->join_sema);
+  }
+
+  /* If the main thread calls pthread_exit, it must wait for all
+     unjoined threads in the process to finish before terminating. */
+  if (cur->pcb != NULL && is_main_thread(cur, cur->pcb)) {
+    struct list* ts = &cur->pcb->thread_statuses;
+    struct list_elem* e = list_begin(ts);
+    while (e != list_end(ts)) {
+      struct thread_status_node* t = list_entry(e, struct thread_status_node, elem);
+      e = list_next(e);
+      if (t != tsn && !t->is_joined && !t->is_exited)
+        sema_down(&t->join_sema);
+    }
+    exit_process(0);
   }
 
   thread_exit();

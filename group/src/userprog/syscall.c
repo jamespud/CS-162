@@ -18,7 +18,7 @@ static void check_valid_bytes(const void* vaddr, size_t size);
 static size_t safe_strlen(const void* vaddr);
 void exit_process(int status);
 
-static struct lock filesys_lock;
+struct lock filesys_lock;
 
 void syscall_init(void) {
   intr_register_int(0x30, 3, INTR_ON, syscall_handler, "syscall");
@@ -77,6 +77,8 @@ static size_t safe_strlen(const void* vaddr) {
 }
 
 static bool syscall_lock_init(char* lock) {
+  if (lock == NULL)
+    return false;
   struct process* pcb = thread_current()->pcb;
   uint32_t idx = -1;
 
@@ -126,6 +128,10 @@ static bool syscall_lock_release(char* lock) {
 }
 
 static bool syscall_sema_init(char* sema, int val) {
+  if (val < 0)
+    return false;
+  if (sema == NULL)
+    return false;
   struct process* pcb = thread_current()->pcb;
   uint32_t idx = -1;
 
@@ -432,6 +438,10 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
     case SYS_SEMA_UP: {
       check_valid_bytes(args, 2 * sizeof(uint32_t));
       f->eax = syscall_sema_up((char*)args[1]);
+      break;
+    }
+    case SYS_GET_TID: {
+      f->eax = thread_current()->tid;
       break;
     }
     default: {

@@ -80,6 +80,8 @@ void timer_sleep(int64_t ticks) {
   int64_t start = timer_ticks();
 
   ASSERT(intr_get_level() == INTR_ON);
+  if (ticks <= 0)
+    return;
   enum intr_level old_level = intr_disable();
   thread_current()->wakeup_tick = start + ticks;
   thread_block();
