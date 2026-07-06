@@ -587,20 +587,15 @@ void process_exit(void) {
 
   if (share_count > 1) {
     /* Other threads are still alive. Just kill this thread; the last
-       survivor will perform the full teardown and wake the parent. */
+       survivor will perform the full teardown. The exit announcement
+       and parent wake-up were already done by exit_process(). */
     thread_exit();
     NOT_REACHED();
   }
 
-  /* We are the last surviving thread: announce exit, wake the parent,
-     then tear down shared resources. */
-  if (cur->pcb->my_status != NULL) {
-    printf("%s: exit(%d)\n", cur->pcb->process_name, cur->pcb->exit_code);
-    cur->pcb->my_status->exit_status = cur->pcb->exit_code;
-    cur->pcb->my_status->is_alive = false;
-    sema_up(&cur->pcb->my_status->wait_sema);
-  }
-
+  /* We are the last surviving thread: tear down shared resources. The
+     exit announcement / parent wake-up were already done by the first
+     exit_process() caller. */
   struct list_elem* e;
   for (e = list_begin(&cur->pcb->children); e != list_end(&cur->pcb->children);) {
     struct child_status* child_status = list_entry(e, struct child_status, elem);

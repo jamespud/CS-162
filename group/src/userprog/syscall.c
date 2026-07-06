@@ -33,18 +33,31 @@ void exit_process(int status) {
     NOT_REACHED();
   }
 
-  /* Record the process-wide exit intent once. Subsequent callers (other
-     threads racing into exit, or the syscall-entry suicide check) will see
-     pcb->exiting and simply die without re-tearing-down. */
+  /* The first thread to call exit_process announces the process exit
+     (prints the exit line and wakes the parent's wait()) exactly once.
+     This must happen immediately -- even if sibling threads are still
+     alive (e.g. one blocked in pthread_exit's join-wait loop on this
+     very thread) -- otherwise the parent could block forever. Shared
+     resource teardown is still deferred to the last surviving thread
+     inside process_exit(). */
   enum intr_level old_level = intr_disable();
-  if (!pcb->exiting) {
+  bool first = !pcb->exiting;
+  if (first) {
     pcb->exiting = true;
     pcb->exit_code = status;
   }
   intr_set_level(old_level);
 
-  /* process_exit() defers shared-resource teardown to the last surviving
-     thread of this process and wakes the parent at that point. */
+  /* Announce with interrupts enabled so we never deadlock on the
+     console lock (a preempted writer could be holding it). Only the
+     first caller announces; later callers see pcb->exiting and skip. */
+  if (first && pcb->my_status != NULL) {
+    printf("%s: exit(%d)\n", pcb->process_name, status);
+    pcb->my_status->exit_status = status;
+    pcb->my_status->is_alive = false;
+    sema_up(&pcb->my_status->wait_sema);
+  }
+
   process_exit();
 }
 
@@ -217,9 +230,9 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
       int fd = (int)args[1];
       const void* buffer = (const void*)args[2];
       unsigned size = (unsigned)args[3];
+      check_valid_bytes(buffer, size);
 
       if (fd == 1) {
-        check_valid_bytes(buffer, size);
         putbuf(buffer, size);
         f->eax = size;
       } else {
@@ -229,7 +242,6 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
           lock_release(&filesys_lock);
           f->eax = -1;
         } else {
-          check_valid_bytes(buffer, size);
           int n = file_write(file_ptr, buffer, size);
           lock_release(&filesys_lock);
           f->eax = n;
