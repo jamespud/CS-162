@@ -28,18 +28,23 @@ void syscall_init(void) {
 void exit_process(int status) {
   struct process* pcb = thread_current()->pcb;
 
-  // 1. 打印 Pintos 测试系统强制要求的退出信息
-  // printf("%s: exit(%d)\n", pcb->process_name, status);
-
-  // 2. 如果我有父进程（my_status 不为 NULL），更新我的遗产
-  if (pcb->my_status != NULL) {
-    pcb->my_status->exit_status = status;
-    pcb->my_status->is_alive = false;
-    // 唤醒可能正在 wait 我的父进程
-    sema_up(&pcb->my_status->wait_sema);
+  if (pcb == NULL) {
+    thread_exit();
+    NOT_REACHED();
   }
 
-  // 3. 将退出状态返回给内核并真正回收资源
+  /* Record the process-wide exit intent once. Subsequent callers (other
+     threads racing into exit, or the syscall-entry suicide check) will see
+     pcb->exiting and simply die without re-tearing-down. */
+  enum intr_level old_level = intr_disable();
+  if (!pcb->exiting) {
+    pcb->exiting = true;
+    pcb->exit_code = status;
+  }
+  intr_set_level(old_level);
+
+  /* process_exit() defers shared-resource teardown to the last surviving
+     thread of this process and wakes the parent at that point. */
   process_exit();
 }
 
@@ -111,7 +116,8 @@ static bool syscall_lock_acquire(char* lock) {
     return false;
   }
 
-  return lock_try_acquire(kernel_lock);
+  lock_acquire(kernel_lock);
+  return true;
 }
 
 static bool syscall_lock_release(char* lock) {
@@ -180,6 +186,13 @@ static bool syscall_sema_up(char* sema) {
 }
 
 static void syscall_handler(struct intr_frame* f UNUSED) {
+  /* If our process is already exiting (another thread triggered exit),
+     die immediately rather than touching user memory or shared state. */
+  if (thread_current()->pcb != NULL && thread_current()->pcb->exiting) {
+    process_exit();
+    NOT_REACHED();
+  }
+
   check_valid_bytes(f->esp, sizeof(uint32_t));
   uint32_t* args = ((uint32_t*)f->esp);
 

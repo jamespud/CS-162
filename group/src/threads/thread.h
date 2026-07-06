@@ -114,6 +114,8 @@ struct thread {
   struct process* pcb; /* Process control block if this thread is a userprog */
   struct thread_status_node*
       status_node; /* Pointer to this thread's status node in the parent process's list */
+  void* stack_upage; /* User VA of this pthread's stack page (NULL if not a pthread). */
+  int stack_slot;     /* Per-process stack slot index, or -1 if not a pthread. */
 #endif
 
   /* Owned by thread.c. */

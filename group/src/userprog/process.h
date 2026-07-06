@@ -55,6 +55,11 @@ struct process {
   struct file* exec_file;         /* 可执行文件，用于 ROX 保护 */
   struct list thread_statuses;    /* 进程中的所有线程 */
 
+  bool exiting;                      /* true once any thread triggered process exit. */
+  int exit_code;                     /* Process exit code (set once). */
+  bool stack_slot_used[MAX_THREADS]; /* pthread stack slot allocation bitmap. */
+  struct lock pagedir_lock;          /* Serializes pthread stack page table edits. */
+
   struct lock* user_locks[USER_LOCK_SIZE];      // 索引 → 内核 lock 指针
   struct semaphore* user_semas[USER_SEMA_SIZE]; // 同理
 };
