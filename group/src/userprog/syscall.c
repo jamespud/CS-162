@@ -1,13 +1,15 @@
 #include "userprog/syscall.h"
 #include "devices/shutdown.h"
+#include "filesys/file.h"
 #include "filesys/filesys.h"
+#include "filesys/inode.h"
 #include "threads/interrupt.h"
 #include "threads/malloc.h"
+#include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "userprog/pagedir.h"
 #include "userprog/process.h"
-#include "threads/synch.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <syscall-nr.h>
@@ -250,13 +252,23 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
     struct file* file_ptr = (struct file*)get_kernel_fd(pcb, fd);
     /* Skip file_close for inherited fds to avoid double-close on shared struct file */
     if (file_ptr != NULL) {
-      bool inherited = (fd >= 0 && fd < 128
-                        && pcb->fd_table != NULL
-                        && pcb->fd_table->inherited[fd]);
+      bool inherited =
+          (fd >= 0 && fd < 128 && pcb->fd_table != NULL && pcb->fd_table->inherited[fd]);
       if (!inherited)
         file_close(file_ptr);
     }
     remove_fd(pcb, fd);
+    lock_release(&filesys_lock);
+  } else if (args[0] == SYS_INUMBER) {
+    check_valid_bytes(args, 2 * sizeof(uint32_t));
+    int fd = (int)args[1];
+    lock_acquire(&filesys_lock);
+    struct file* file = get_kernel_fd(thread_current()->pcb, fd);
+    if (file == NULL) {
+      f->eax = -1;
+    } else {
+      f->eax = inode_get_inumber(file_get_inode(file));
+    }
     lock_release(&filesys_lock);
   }
 }

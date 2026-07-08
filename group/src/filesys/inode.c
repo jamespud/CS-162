@@ -13,18 +13,27 @@
 
 #define BUFFER_SIZE 64
 
+#define DIRECT_PTRS 124
+#define INDIR_PTRS (BLOCK_SECTOR_SIZE / sizeof(block_sector_t))              /* 128 */
+#define DBL_RANGE (DIRECT_PTRS + INDIR_PTRS)                                 /* 252 */
+#define MAX_FILE_BLOCKS (DIRECT_PTRS + INDIR_PTRS + INDIR_PTRS * INDIR_PTRS) /* 16636 */
+
 /* On-disk inode.
    Must be exactly BLOCK_SECTOR_SIZE bytes long. */
 struct inode_disk {
-  block_sector_t start; /* First data sector. */
-  off_t length;         /* File size in bytes. */
-  unsigned magic;       /* Magic number. */
-  uint32_t unused[125]; /* Not used. */
+  off_t length;                       /* File size in bytes. */
+  unsigned magic;                     /* Magic number. */
+  block_sector_t direct[DIRECT_PTRS]; /* 496 */
+  block_sector_t indirect;            /* 4 */
+  block_sector_t doubly_indirect;     /* 4 */
 };
 
 /* Returns the number of sectors to allocate for an inode SIZE
    bytes long. */
 static inline size_t bytes_to_sectors(off_t size) { return DIV_ROUND_UP(size, BLOCK_SECTOR_SIZE); }
+
+/* All-zero sector, used to zero newly allocated data and index blocks. */
+static char zero_sector[BLOCK_SECTOR_SIZE];
 
 /* In-memory inode. */
 struct inode {
@@ -62,6 +71,10 @@ static void cache_evict(int index);
 static void cache_flush_entry(int index);
 static void cache_read(block_sector_t sector, void* buf, int sector_ofs, int chunk_size);
 static void cache_write(block_sector_t sector, const void* buf, int sector_ofs, int chunk_size);
+static block_sector_t index_lookup(const struct inode_disk* id, size_t block_idx);
+static bool index_allocate(struct inode_disk* id, size_t block_idx, block_sector_t sector);
+static bool disk_inode_allocate_block(struct inode_disk* id, size_t block_idx, bool* grew);
+static void index_free_all(const struct inode_disk* id);
 
 /* Returns the block device sector that contains byte offset POS
    within INODE.
@@ -69,9 +82,11 @@ static void cache_write(block_sector_t sector, const void* buf, int sector_ofs, 
    POS. */
 static block_sector_t byte_to_sector(const struct inode* inode, off_t pos) {
   ASSERT(inode != NULL);
-  if (pos < inode->data.length)
-    return inode->data.start + pos / BLOCK_SECTOR_SIZE;
-  else
+  if (pos < inode->data.length) {
+    int block_idx = pos / BLOCK_SECTOR_SIZE;
+    block_sector_t sec = index_lookup(&inode->data, block_idx);
+    return sec != 0 ? sec : (block_sector_t)-1;
+  } else
     return -1;
 }
 
@@ -82,14 +97,167 @@ static struct list open_inodes;
 /* Initializes the inode module. */
 void inode_init(void) { list_init(&open_inodes); }
 
+/* Returns the data sector that stores logical block BLOCK_IDX of the
+   inode whose on-disk image is ID, or 0 if that block is not
+   allocated (a sparse hole). */
+static block_sector_t index_lookup(const struct inode_disk* id, size_t block_idx) {
+  ASSERT(id != NULL);
+  ASSERT(block_idx < MAX_FILE_BLOCKS);
+
+  if (block_idx < DIRECT_PTRS)
+    return id->direct[block_idx];
+
+  if (block_idx < DBL_RANGE) {
+    if (id->indirect == 0)
+      return 0;
+    block_sector_t block[INDIR_PTRS];
+    cache_read(id->indirect, block, 0, BLOCK_SECTOR_SIZE);
+    return block[block_idx - DIRECT_PTRS];
+  }
+
+  /* Doubly-indirect range. */
+  if (id->doubly_indirect == 0)
+    return 0;
+  block_sector_t dbl_block[INDIR_PTRS];
+  cache_read(id->doubly_indirect, dbl_block, 0, BLOCK_SECTOR_SIZE);
+  size_t di = (block_idx - DBL_RANGE) / INDIR_PTRS;
+  size_t inner = (block_idx - DBL_RANGE) % INDIR_PTRS;
+  if (dbl_block[di] == 0)
+    return 0;
+  block_sector_t ind_block[INDIR_PTRS];
+  cache_read(dbl_block[di], ind_block, 0, BLOCK_SECTOR_SIZE);
+  return ind_block[inner];
+}
+
+/* Links SECTOR as the data block for logical block BLOCK_IDX in ID,
+   allocating and zeroing index blocks as needed.  Returns true on
+   success.  On failure returns false and leaves any index block
+   allocated in this call linked into ID (it will be reclaimed by
+   index_free_all); the caller retains ownership of SECTOR. */
+static bool index_allocate(struct inode_disk* id, size_t block_idx, block_sector_t sector) {
+  ASSERT(id != NULL);
+  ASSERT(block_idx < MAX_FILE_BLOCKS);
+  ASSERT(sector != 0);
+
+  if (block_idx < DIRECT_PTRS) {
+    id->direct[block_idx] = sector;
+    return true;
+  }
+
+  if (block_idx < DBL_RANGE) {
+    if (id->indirect == 0) {
+      if (!free_map_allocate_one(&id->indirect))
+        return false;
+      cache_write(id->indirect, zero_sector, 0, BLOCK_SECTOR_SIZE);
+    }
+    block_sector_t block[INDIR_PTRS];
+    cache_read(id->indirect, block, 0, BLOCK_SECTOR_SIZE);
+    block[block_idx - DIRECT_PTRS] = sector;
+    cache_write(id->indirect, block, 0, BLOCK_SECTOR_SIZE);
+    return true;
+  }
+
+  /* Doubly-indirect range. */
+  if (id->doubly_indirect == 0) {
+    if (!free_map_allocate_one(&id->doubly_indirect))
+      return false;
+    cache_write(id->doubly_indirect, zero_sector, 0, BLOCK_SECTOR_SIZE);
+  }
+  size_t di = (block_idx - DBL_RANGE) / INDIR_PTRS;
+  size_t inner = (block_idx - DBL_RANGE) % INDIR_PTRS;
+
+  block_sector_t dbl_block[INDIR_PTRS];
+  cache_read(id->doubly_indirect, dbl_block, 0, BLOCK_SECTOR_SIZE);
+  if (dbl_block[di] == 0) {
+    if (!free_map_allocate_one(&dbl_block[di]))
+      return false;
+    cache_write(dbl_block[di], zero_sector, 0, BLOCK_SECTOR_SIZE);
+    cache_write(id->doubly_indirect, dbl_block, 0, BLOCK_SECTOR_SIZE);
+  }
+  block_sector_t ind_block[INDIR_PTRS];
+  cache_read(dbl_block[di], ind_block, 0, BLOCK_SECTOR_SIZE);
+  ind_block[inner] = sector;
+  cache_write(dbl_block[di], ind_block, 0, BLOCK_SECTOR_SIZE);
+  return true;
+}
+
+/* Ensures logical block BLOCK_IDX of ID is allocated and zeroed.
+   Returns true if the block already existed or was just allocated,
+   false if BLOCK_IDX is out of range or disk space is exhausted.
+   *GREW (if non-NULL) is set true when a new block was allocated.
+   On failure no partial state is left for this block: a freshly
+   allocated data sector is released. */
+static bool disk_inode_allocate_block(struct inode_disk* id, size_t block_idx, bool* grew) {
+  ASSERT(id != NULL);
+
+  if (block_idx >= MAX_FILE_BLOCKS)
+    return false;
+
+  if (index_lookup(id, block_idx) != 0)
+    return true;
+
+  block_sector_t sector;
+  if (!free_map_allocate_one(&sector))
+    return false;
+
+  /* Zero the new data block so partial writes and sparse reads are
+     correct. */
+  cache_write(sector, zero_sector, 0, BLOCK_SECTOR_SIZE);
+
+  if (!index_allocate(id, block_idx, sector)) {
+    free_map_release_one(sector);
+    return false;
+  }
+  if (grew != NULL)
+    *grew = true;
+  return true;
+}
+
+/* Frees every data block and index block referenced by ID through the
+   deferred free-map interface.  The caller must free_map_flush()
+   afterwards to persist the bitmap. */
+static void index_free_all(const struct inode_disk* id) {
+  ASSERT(id != NULL);
+  size_t i;
+
+  for (i = 0; i < DIRECT_PTRS; i++)
+    if (id->direct[i] != 0)
+      free_map_release_one(id->direct[i]);
+
+  if (id->indirect != 0) {
+    block_sector_t block[INDIR_PTRS];
+    cache_read(id->indirect, block, 0, BLOCK_SECTOR_SIZE);
+    for (i = 0; i < INDIR_PTRS; i++)
+      if (block[i] != 0)
+        free_map_release_one(block[i]);
+    free_map_release_one(id->indirect);
+  }
+
+  if (id->doubly_indirect != 0) {
+    block_sector_t dbl_block[INDIR_PTRS];
+    cache_read(id->doubly_indirect, dbl_block, 0, BLOCK_SECTOR_SIZE);
+    for (i = 0; i < INDIR_PTRS; i++) {
+      if (dbl_block[i] != 0) {
+        block_sector_t ind_block[INDIR_PTRS];
+        cache_read(dbl_block[i], ind_block, 0, BLOCK_SECTOR_SIZE);
+        for (size_t j = 0; j < INDIR_PTRS; j++)
+          if (ind_block[j] != 0)
+            free_map_release_one(ind_block[j]);
+        free_map_release_one(dbl_block[i]);
+      }
+    }
+    free_map_release_one(id->doubly_indirect);
+  }
+}
+
 /* Initializes an inode with LENGTH bytes of data and
    writes the new inode to sector SECTOR on the file system
    device.
    Returns true if successful.
    Returns false if memory or disk allocation fails. */
 bool inode_create(block_sector_t sector, off_t length) {
-  struct inode_disk* disk_inode = NULL;
-  bool success = false;
+  struct inode_disk* disk_inode;
+  bool success = true;
 
   ASSERT(length >= 0);
 
@@ -98,23 +266,29 @@ bool inode_create(block_sector_t sector, off_t length) {
   ASSERT(sizeof *disk_inode == BLOCK_SECTOR_SIZE);
 
   disk_inode = calloc(1, sizeof *disk_inode);
-  if (disk_inode != NULL) {
-    size_t sectors = bytes_to_sectors(length);
-    disk_inode->length = length;
-    disk_inode->magic = INODE_MAGIC;
-    if (free_map_allocate(sectors, &disk_inode->start)) {
-      cache_write(sector, disk_inode, 0, BLOCK_SECTOR_SIZE);
-      if (sectors > 0) {
-        static char zeros[BLOCK_SECTOR_SIZE];
-        size_t i;
+  if (disk_inode == NULL)
+    return false;
 
-        for (i = 0; i < sectors; i++)
-          cache_write(disk_inode->start + i, zeros, 0, BLOCK_SECTOR_SIZE);
-      }
-      success = true;
+  disk_inode->length = length;
+  disk_inode->magic = INODE_MAGIC;
+
+  size_t sectors = bytes_to_sectors(length);
+  for (size_t i = 0; i < sectors; i++) {
+    if (!disk_inode_allocate_block(disk_inode, i, NULL)) {
+      success = false;
+      break;
     }
-    free(disk_inode);
   }
+
+  if (success) {
+    cache_write(sector, disk_inode, 0, BLOCK_SECTOR_SIZE);
+    free_map_flush();
+  } else {
+    /* Roll back every block allocated so far. */
+    index_free_all(disk_inode);
+    free_map_flush();
+  }
+  free(disk_inode);
   return success;
 }
 
@@ -174,10 +348,10 @@ void inode_close(struct inode* inode) {
 
     /* Deallocate blocks if removed. */
     if (inode->removed) {
+      index_free_all(&inode->data);
       free_map_release(inode->sector, 1);
-      free_map_release(inode->data.start, bytes_to_sectors(inode->data.length));
+      free_map_flush();
     }
-
     free(inode);
   }
 }
@@ -211,7 +385,11 @@ off_t inode_read_at(struct inode* inode, void* buffer_, off_t size, off_t offset
     if (chunk_size <= 0)
       break;
 
-    cache_read(sector_idx, buffer + bytes_read, sector_ofs, chunk_size);
+    if (sector_idx == (block_sector_t)-1) {
+      memset(buffer + bytes_read, 0, chunk_size);
+    } else {
+      cache_read(sector_idx, buffer + bytes_read, sector_ofs, chunk_size);
+    }
 
     /* Advance. */
     size -= chunk_size;
@@ -230,31 +408,46 @@ off_t inode_read_at(struct inode* inode, void* buffer_, off_t size, off_t offset
 off_t inode_write_at(struct inode* inode, const void* buffer_, off_t size, off_t offset) {
   const uint8_t* buffer = buffer_;
   off_t bytes_written = 0;
+  bool grew = false;
+  bool length_changed = false;
 
   if (inode->deny_write_cnt)
     return 0;
 
   while (size > 0) {
     /* Sector to write, starting byte offset within sector. */
-    block_sector_t sector_idx = byte_to_sector(inode, offset);
+    size_t block_idx = offset / BLOCK_SECTOR_SIZE;
     int sector_ofs = offset % BLOCK_SECTOR_SIZE;
-
-    /* Bytes left in inode, bytes left in sector, lesser of the two. */
-    off_t inode_left = inode_length(inode) - offset;
     int sector_left = BLOCK_SECTOR_SIZE - sector_ofs;
-    int min_left = inode_left < sector_left ? inode_left : sector_left;
+    int chunk_size = size < sector_left ? size : sector_left;
 
-    /* Number of bytes to actually write into this sector. */
-    int chunk_size = size < min_left ? size : min_left;
-    if (chunk_size <= 0)
+    /* Grow the file to cover this block.  On disk-full, stop and
+       keep whatever has been written so far. */
+    if (!disk_inode_allocate_block(&inode->data, block_idx, &grew))
       break;
 
+    /* The block may have just been allocated, so re-resolve the sector
+       after growth (byte_to_sector would return -1 past old EOF). */
+    block_sector_t sector_idx = index_lookup(&inode->data, block_idx);
     cache_write(sector_idx, buffer + bytes_written, sector_ofs, chunk_size);
 
     /* Advance. */
     size -= chunk_size;
     offset += chunk_size;
     bytes_written += chunk_size;
+
+    if (offset > inode->data.length) {
+      inode->data.length = offset;
+      length_changed = true;
+    }
+  }
+
+  /* Persist the inode (length/pointers) and, only when blocks were
+     allocated, the free map. */
+  if (grew || length_changed) {
+    cache_write(inode->sector, &inode->data, 0, BLOCK_SECTOR_SIZE);
+    if (grew)
+      free_map_flush();
   }
 
   return bytes_written;

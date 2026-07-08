@@ -1,9 +1,9 @@
 #include "filesys/free-map.h"
-#include <bitmap.h>
-#include <debug.h>
 #include "filesys/file.h"
 #include "filesys/filesys.h"
 #include "filesys/inode.h"
+#include <bitmap.h>
+#include <debug.h>
 
 static struct file* free_map_file; /* Free map file. */
 static struct bitmap* free_map;    /* Free map, one bit per sector. */
@@ -33,11 +33,33 @@ bool free_map_allocate(size_t cnt, block_sector_t* sectorp) {
   return sector != BITMAP_ERROR;
 }
 
+/* Allocates a single sector from the free map and stores it into
+   *SECTORP.  Does NOT persist the bitmap to disk; the caller must
+   free_map_flush() after a batch of allocations.  Returns true on
+   success, false if no sector is available. */
+bool free_map_allocate_one(block_sector_t* sectorp) {
+  block_sector_t sector = bitmap_scan_and_flip(free_map, 0, 1, false);
+  if (sector != BITMAP_ERROR)
+    *sectorp = sector;
+  return sector != BITMAP_ERROR;
+}
+
 /* Makes CNT sectors starting at SECTOR available for use. */
 void free_map_release(block_sector_t sector, size_t cnt) {
   ASSERT(bitmap_all(free_map, sector, cnt));
   bitmap_set_multiple(free_map, sector, cnt, false);
   bitmap_write(free_map, free_map_file);
+}
+
+void free_map_release_one(block_sector_t sector) {
+  ASSERT(bitmap_all(free_map, sector, 1));
+  bitmap_set_multiple(free_map, sector, 1, false);
+}
+
+void free_map_flush(void) {
+  if (free_map_file != NULL) {
+    bitmap_write(free_map, free_map_file);
+  }
 }
 
 /* Opens the free map file and reads it from disk. */
