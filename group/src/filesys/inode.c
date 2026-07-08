@@ -1,14 +1,17 @@
 #include "filesys/inode.h"
-#include <list.h>
-#include <debug.h>
-#include <round.h>
-#include <string.h>
 #include "filesys/filesys.h"
 #include "filesys/free-map.h"
 #include "threads/malloc.h"
+#include "threads/synch.h"
+#include <debug.h>
+#include <list.h>
+#include <round.h>
+#include <string.h>
 
 /* Identifies an inode. */
 #define INODE_MAGIC 0x494e4f44
+
+#define BUFFER_SIZE 64
 
 /* On-disk inode.
    Must be exactly BLOCK_SECTOR_SIZE bytes long. */
@@ -32,6 +35,33 @@ struct inode {
   int deny_write_cnt;     /* 0: writes ok, >0: deny writes. */
   struct inode_disk data; /* Inode content. */
 };
+
+/* A single entry in the buffer cache. */
+struct cache_entry {
+  uint8_t data[BLOCK_SECTOR_SIZE]; /* Cached block data. */
+  block_sector_t sector_num;       /* Sector this entry caches. */
+  bool dirty;                      /* True if modified, needs writeback. */
+  bool valid;                      /* True if entry holds valid data. */
+  bool accessed;                   /* Reference bit for clock algorithm. */
+  int pin_count;                   /* Number of active readers/writers. */
+  struct lock lock;                /* Protects this entry's data. */
+};
+
+/* The buffer cache: 64 cache entries plus metadata. */
+struct buffer_cache {
+  struct cache_entry entries[BUFFER_SIZE]; /* Cached blocks. */
+  struct lock lock;                        /* Protects cache metadata. */
+  uint32_t clock_hand;                     /* Clock hand for replacement. */
+};
+
+static struct buffer_cache cache;
+
+static int cache_lookup(block_sector_t sector);
+static int cache_select_victim(void);
+static void cache_evict(int index);
+static void cache_flush_entry(int index);
+static void cache_read(block_sector_t sector, void* buf, int sector_ofs, int chunk_size);
+static void cache_write(block_sector_t sector, const void* buf, int sector_ofs, int chunk_size);
 
 /* Returns the block device sector that contains byte offset POS
    within INODE.
@@ -73,13 +103,13 @@ bool inode_create(block_sector_t sector, off_t length) {
     disk_inode->length = length;
     disk_inode->magic = INODE_MAGIC;
     if (free_map_allocate(sectors, &disk_inode->start)) {
-      block_write(fs_device, sector, disk_inode);
+      cache_write(sector, disk_inode, 0, BLOCK_SECTOR_SIZE);
       if (sectors > 0) {
         static char zeros[BLOCK_SECTOR_SIZE];
         size_t i;
 
         for (i = 0; i < sectors; i++)
-          block_write(fs_device, disk_inode->start + i, zeros);
+          cache_write(disk_inode->start + i, zeros, 0, BLOCK_SECTOR_SIZE);
       }
       success = true;
     }
@@ -115,7 +145,7 @@ struct inode* inode_open(block_sector_t sector) {
   inode->open_cnt = 1;
   inode->deny_write_cnt = 0;
   inode->removed = false;
-  block_read(fs_device, inode->sector, &inode->data);
+  cache_read(inode->sector, &inode->data, 0, BLOCK_SECTOR_SIZE);
   return inode;
 }
 
@@ -165,7 +195,6 @@ void inode_remove(struct inode* inode) {
 off_t inode_read_at(struct inode* inode, void* buffer_, off_t size, off_t offset) {
   uint8_t* buffer = buffer_;
   off_t bytes_read = 0;
-  uint8_t* bounce = NULL;
 
   while (size > 0) {
     /* Disk sector to read, starting byte offset within sector. */
@@ -182,27 +211,13 @@ off_t inode_read_at(struct inode* inode, void* buffer_, off_t size, off_t offset
     if (chunk_size <= 0)
       break;
 
-    if (sector_ofs == 0 && chunk_size == BLOCK_SECTOR_SIZE) {
-      /* Read full sector directly into caller's buffer. */
-      block_read(fs_device, sector_idx, buffer + bytes_read);
-    } else {
-      /* Read sector into bounce buffer, then partially copy
-             into caller's buffer. */
-      if (bounce == NULL) {
-        bounce = malloc(BLOCK_SECTOR_SIZE);
-        if (bounce == NULL)
-          break;
-      }
-      block_read(fs_device, sector_idx, bounce);
-      memcpy(buffer + bytes_read, bounce + sector_ofs, chunk_size);
-    }
+    cache_read(sector_idx, buffer + bytes_read, sector_ofs, chunk_size);
 
     /* Advance. */
     size -= chunk_size;
     offset += chunk_size;
     bytes_read += chunk_size;
   }
-  free(bounce);
 
   return bytes_read;
 }
@@ -215,7 +230,6 @@ off_t inode_read_at(struct inode* inode, void* buffer_, off_t size, off_t offset
 off_t inode_write_at(struct inode* inode, const void* buffer_, off_t size, off_t offset) {
   const uint8_t* buffer = buffer_;
   off_t bytes_written = 0;
-  uint8_t* bounce = NULL;
 
   if (inode->deny_write_cnt)
     return 0;
@@ -235,34 +249,13 @@ off_t inode_write_at(struct inode* inode, const void* buffer_, off_t size, off_t
     if (chunk_size <= 0)
       break;
 
-    if (sector_ofs == 0 && chunk_size == BLOCK_SECTOR_SIZE) {
-      /* Write full sector directly to disk. */
-      block_write(fs_device, sector_idx, buffer + bytes_written);
-    } else {
-      /* We need a bounce buffer. */
-      if (bounce == NULL) {
-        bounce = malloc(BLOCK_SECTOR_SIZE);
-        if (bounce == NULL)
-          break;
-      }
-
-      /* If the sector contains data before or after the chunk
-             we're writing, then we need to read in the sector
-             first.  Otherwise we start with a sector of all zeros. */
-      if (sector_ofs > 0 || chunk_size < sector_left)
-        block_read(fs_device, sector_idx, bounce);
-      else
-        memset(bounce, 0, BLOCK_SECTOR_SIZE);
-      memcpy(bounce + sector_ofs, buffer + bytes_written, chunk_size);
-      block_write(fs_device, sector_idx, bounce);
-    }
+    cache_write(sector_idx, buffer + bytes_written, sector_ofs, chunk_size);
 
     /* Advance. */
     size -= chunk_size;
     offset += chunk_size;
     bytes_written += chunk_size;
   }
-  free(bounce);
 
   return bytes_written;
 }
@@ -285,3 +278,161 @@ void inode_allow_write(struct inode* inode) {
 
 /* Returns the length, in bytes, of INODE's data. */
 off_t inode_length(const struct inode* inode) { return inode->data.length; }
+
+/* Initializes the buffer cache. Must be called before any cache use. */
+void cache_init(void) {
+  lock_init(&cache.lock);
+  cache.clock_hand = 0;
+
+  for (size_t i = 0; i < BUFFER_SIZE; i++) {
+    struct cache_entry* e = &cache.entries[i];
+    lock_init(&e->lock);
+    e->sector_num = 0;
+    e->dirty = false;
+    e->valid = false;
+    e->accessed = false;
+    e->pin_count = 0;
+    memset(e->data, 0, BLOCK_SECTOR_SIZE);
+  }
+}
+
+/* Looks up SECTOR in the cache. Caller must hold cache.lock.
+   Returns the cache index, or -1 if not present. */
+static int cache_lookup(block_sector_t sector) {
+  for (size_t i = 0; i < BUFFER_SIZE; i++) {
+    if (cache.entries[i].valid && cache.entries[i].sector_num == sector)
+      return (int)i;
+  }
+  return -1;
+}
+
+/* Selects a cache entry to evict using the clock algorithm.
+   Caller must hold cache.lock. Returns the index of the victim. */
+static int cache_select_victim(void) {
+  for (int pass = 0; pass < 2; pass++) {
+    for (size_t i = 0; i < BUFFER_SIZE; i++) {
+      uint32_t idx = (cache.clock_hand + i) % BUFFER_SIZE;
+      struct cache_entry* e = &cache.entries[idx];
+      if (e->pin_count > 0)
+        continue;
+      if (e->accessed) {
+        e->accessed = false;
+        continue;
+      }
+      cache.clock_hand = (idx + 1) % BUFFER_SIZE;
+      return (int)idx;
+    }
+  }
+  NOT_REACHED();
+}
+
+/* Evicts the entry at INDEX, writing it back to disk if dirty.
+   Caller must hold cache.lock. */
+static void cache_evict(int index) {
+  struct cache_entry* e = &cache.entries[index];
+  if (e->dirty)
+    block_write(fs_device, e->sector_num, e->data);
+  e->valid = false;
+  e->dirty = false;
+  e->accessed = false;
+  e->sector_num = 0;
+}
+
+/* Writes the entry at INDEX back to disk if it is dirty, then clears
+   the dirty bit. Keeps the entry cached. Caller must hold cache.lock. */
+static void cache_flush_entry(int index) {
+  struct cache_entry* e = &cache.entries[index];
+  lock_acquire(&e->lock);
+  if (e->valid && e->dirty) {
+    block_write(fs_device, e->sector_num, e->data);
+    e->dirty = false;
+  }
+  lock_release(&e->lock);
+}
+
+/* Writes all dirty cache entries back to disk. Called at shutdown. */
+void cache_flush_all(void) {
+  lock_acquire(&cache.lock);
+  for (size_t i = 0; i < BUFFER_SIZE; i++)
+    cache_flush_entry(i);
+  lock_release(&cache.lock);
+}
+
+/* Reads CHUNK_SIZE bytes starting at SECTOR_OFS within SECTOR into BUF,
+   through the buffer cache. */
+static void cache_read(block_sector_t sector, void* buf, int sector_ofs, int chunk_size) {
+  struct cache_entry* e;
+
+  lock_acquire(&cache.lock);
+  int index = cache_lookup(sector);
+  if (index == -1) {
+    index = cache_select_victim();
+    cache_evict(index);
+    e = &cache.entries[index];
+    lock_acquire(&e->lock);
+    e->sector_num = sector;
+    e->valid = true;
+    e->dirty = false;
+    e->accessed = true;
+    e->pin_count = 1;
+    lock_release(&cache.lock);
+    block_read(fs_device, sector, e->data);
+    memcpy(buf, e->data + sector_ofs, chunk_size);
+    lock_release(&e->lock);
+    lock_acquire(&cache.lock);
+    e->pin_count--;
+    lock_release(&cache.lock);
+  } else {
+    e = &cache.entries[index];
+    e->pin_count++;
+    e->accessed = true;
+    lock_acquire(&e->lock);
+    lock_release(&cache.lock);
+    memcpy(buf, e->data + sector_ofs, chunk_size);
+    lock_release(&e->lock);
+    lock_acquire(&cache.lock);
+    e->pin_count--;
+    lock_release(&cache.lock);
+  }
+}
+
+/* Writes CHUNK_SIZE bytes from BUF starting at SECTOR_OFS within SECTOR,
+   through the buffer cache. Marks the cached block dirty. */
+static void cache_write(block_sector_t sector, const void* buf, int sector_ofs, int chunk_size) {
+  struct cache_entry* e;
+
+  lock_acquire(&cache.lock);
+  int index = cache_lookup(sector);
+  if (index == -1) {
+    index = cache_select_victim();
+    cache_evict(index);
+    e = &cache.entries[index];
+    lock_acquire(&e->lock);
+    e->sector_num = sector;
+    e->valid = true;
+    e->dirty = false;
+    e->accessed = true;
+    e->pin_count = 1;
+    lock_release(&cache.lock);
+    if (!(sector_ofs == 0 && chunk_size == BLOCK_SECTOR_SIZE))
+      block_read(fs_device, sector, e->data);
+    memcpy(e->data + sector_ofs, buf, chunk_size);
+    lock_release(&e->lock);
+    lock_acquire(&cache.lock);
+    e->dirty = true;
+    e->pin_count--;
+    lock_release(&cache.lock);
+  } else {
+    e = &cache.entries[index];
+    e->pin_count++;
+    e->accessed = true;
+    lock_acquire(&e->lock);
+    lock_release(&cache.lock);
+    memcpy(e->data + sector_ofs, buf, chunk_size);
+    lock_release(&e->lock);
+    lock_acquire(&cache.lock);
+    e->dirty = true;
+    e->pin_count--;
+    lock_release(&cache.lock);
+  }
+}
