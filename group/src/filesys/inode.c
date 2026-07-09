@@ -45,6 +45,7 @@ struct inode {
   bool removed;           /* True if deleted, false otherwise. */
   int deny_write_cnt;     /* 0: writes ok, >0: deny writes. */
   struct inode_disk data; /* Inode content. */
+  struct lock lock;       /* Per-inode metadata lock (extension, dir entries). */
 };
 
 /* A single entry in the buffer cache. */
@@ -69,7 +70,6 @@ static struct buffer_cache cache;
 
 static int cache_lookup(block_sector_t sector);
 static int cache_select_victim(void);
-static void cache_evict(int index);
 static void cache_flush_entry(int index);
 static void cache_read(block_sector_t sector, void* buf, int sector_ofs, int chunk_size);
 static void cache_write(block_sector_t sector, const void* buf, int sector_ofs, int chunk_size);
@@ -96,8 +96,14 @@ static block_sector_t byte_to_sector(const struct inode* inode, off_t pos) {
    returns the same `struct inode'. */
 static struct list open_inodes;
 
+/* Protects the open_inodes list.  Never held across I/O. */
+static struct lock open_inodes_lock;
+
 /* Initializes the inode module. */
-void inode_init(void) { list_init(&open_inodes); }
+void inode_init(void) {
+  list_init(&open_inodes);
+  lock_init(&open_inodes_lock);
+}
 
 /* Returns the data sector that stores logical block BLOCK_IDX of the
    inode whose on-disk image is ID, or 0 if that block is not
@@ -304,26 +310,44 @@ struct inode* inode_open(block_sector_t sector) {
   struct inode* inode;
 
   /* Check whether this inode is already open. */
+  lock_acquire(&open_inodes_lock);
   for (e = list_begin(&open_inodes); e != list_end(&open_inodes); e = list_next(e)) {
     inode = list_entry(e, struct inode, elem);
     if (inode->sector == sector) {
       inode_reopen(inode);
+      lock_release(&open_inodes_lock);
       return inode;
     }
   }
+  lock_release(&open_inodes_lock);
 
-  /* Allocate memory. */
+  /* Allocate memory and load the inode image from disk outside the list
+     lock, so concurrent opens of different inodes issue I/O concurrently. */
   inode = malloc(sizeof *inode);
   if (inode == NULL)
     return NULL;
 
-  /* Initialize. */
-  list_push_front(&open_inodes, &inode->elem);
   inode->sector = sector;
   inode->open_cnt = 1;
   inode->deny_write_cnt = 0;
   inode->removed = false;
+  lock_init(&inode->lock);
   cache_read(inode->sector, &inode->data, 0, BLOCK_SECTOR_SIZE);
+
+  /* Re-check: another thread may have opened the same sector while we
+     loaded the image from disk.  If so, discard ours and reuse theirs. */
+  lock_acquire(&open_inodes_lock);
+  for (e = list_begin(&open_inodes); e != list_end(&open_inodes); e = list_next(e)) {
+    struct inode* other = list_entry(e, struct inode, elem);
+    if (other->sector == sector) {
+      inode_reopen(other);
+      lock_release(&open_inodes_lock);
+      free(inode);
+      return other;
+    }
+  }
+  list_push_front(&open_inodes, &inode->elem);
+  lock_release(&open_inodes_lock);
   return inode;
 }
 
@@ -345,19 +369,25 @@ void inode_close(struct inode* inode) {
   if (inode == NULL)
     return;
 
-  /* Release resources if this was the last opener. */
-  if (--inode->open_cnt == 0) {
-    /* Remove from inode list and release lock. */
-    list_remove(&inode->elem);
-
-    /* Deallocate blocks if removed. */
-    if (inode->removed) {
-      index_free_all(&inode->data);
-      free_map_release(inode->sector, 1);
-      free_map_flush();
-    }
-    free(inode);
+  /* Decrement open count and unlink from the open list under the list lock.
+     The block deallocation (which does I/O) is done outside the lock so the
+     list lock is never held across I/O. */
+  lock_acquire(&open_inodes_lock);
+  if (--inode->open_cnt > 0) {
+    lock_release(&open_inodes_lock);
+    return;
   }
+  list_remove(&inode->elem);
+  lock_release(&open_inodes_lock);
+
+  /* Deallocate blocks if removed.  No other thread can reach this inode now:
+     it is unlinked and open_cnt == 0. */
+  if (inode->removed) {
+    index_free_all(&inode->data);
+    free_map_release(inode->sector, 1);
+    free_map_flush();
+  }
+  free(inode);
 }
 
 /* Marks INODE to be deleted when it is closed by the last caller who
@@ -407,9 +437,20 @@ off_t inode_read_at(struct inode* inode, void* buffer_, off_t size, off_t offset
 /* Writes SIZE bytes from BUFFER into INODE, starting at OFFSET.
    Returns the number of bytes actually written, which may be
    less than SIZE if end of file is reached or an error occurs.
-   (Normally a write at end of file would extend the inode, but
-   growth is not yet implemented.) */
+   Acquires INODE's metadata lock; callers that already hold it
+   (e.g. directory entry modification) should call
+   inode_write_at_nolock() instead. */
 off_t inode_write_at(struct inode* inode, const void* buffer_, off_t size, off_t offset) {
+  off_t bytes_written;
+  lock_acquire(&inode->lock);
+  bytes_written = inode_write_at_nolock(inode, buffer_, size, offset);
+  lock_release(&inode->lock);
+  return bytes_written;
+}
+
+/* Core write logic without acquiring the inode lock.  The caller must
+   hold INODE->lock if concurrent writers are possible. */
+off_t inode_write_at_nolock(struct inode* inode, const void* buffer_, off_t size, off_t offset) {
   const uint8_t* buffer = buffer_;
   off_t bytes_written = 0;
   bool grew = false;
@@ -460,17 +501,21 @@ off_t inode_write_at(struct inode* inode, const void* buffer_, off_t size, off_t
 /* Disables writes to INODE.
    May be called at most once per inode opener. */
 void inode_deny_write(struct inode* inode) {
+  lock_acquire(&inode->lock);
   inode->deny_write_cnt++;
   ASSERT(inode->deny_write_cnt <= inode->open_cnt);
+  lock_release(&inode->lock);
 }
 
 /* Re-enables writes to INODE.
    Must be called once by each inode opener who has called
    inode_deny_write() on the inode, before closing the inode. */
 void inode_allow_write(struct inode* inode) {
+  lock_acquire(&inode->lock);
   ASSERT(inode->deny_write_cnt > 0);
   ASSERT(inode->deny_write_cnt <= inode->open_cnt);
   inode->deny_write_cnt--;
+  lock_release(&inode->lock);
 }
 
 /* Returns the length, in bytes, of INODE's data. */
@@ -523,18 +568,6 @@ static int cache_select_victim(void) {
   NOT_REACHED();
 }
 
-/* Evicts the entry at INDEX, writing it back to disk if dirty.
-   Caller must hold cache.lock. */
-static void cache_evict(int index) {
-  struct cache_entry* e = &cache.entries[index];
-  if (e->dirty)
-    block_write(fs_device, e->sector_num, e->data);
-  e->valid = false;
-  e->dirty = false;
-  e->accessed = false;
-  e->sector_num = 0;
-}
-
 /* Writes the entry at INDEX back to disk if it is dirty, then clears
    the dirty bit. Keeps the entry cached. Caller must hold cache.lock. */
 static void cache_flush_entry(int index) {
@@ -556,81 +589,140 @@ void cache_flush_all(void) {
 }
 
 /* Reads CHUNK_SIZE bytes starting at SECTOR_OFS within SECTOR into BUF,
-   through the buffer cache. */
+   through the buffer cache.  Blocking I/O is performed under the
+   per-entry lock only, never under the global cache lock. */
 static void cache_read(block_sector_t sector, void* buf, int sector_ofs, int chunk_size) {
-  struct cache_entry* e;
+  while (true) {
+    struct cache_entry* e;
+    int index;
 
-  lock_acquire(&cache.lock);
-  int index = cache_lookup(sector);
-  if (index == -1) {
+    lock_acquire(&cache.lock);
+    index = cache_lookup(sector);
+    if (index != -1) {
+      e = &cache.entries[index];
+      e->pin_count++;
+      lock_acquire(&e->lock);
+      lock_release(&cache.lock);
+      if (e->valid && e->sector_num == sector) {
+        e->accessed = true;
+        memcpy(buf, e->data + sector_ofs, chunk_size);
+        lock_release(&e->lock);
+        lock_acquire(&cache.lock);
+        e->pin_count--;
+        lock_release(&cache.lock);
+        return;
+      }
+      /* Entry was repurposed while we waited on e->lock; retry. */
+      lock_release(&e->lock);
+      lock_acquire(&cache.lock);
+      e->pin_count--;
+      lock_release(&cache.lock);
+      continue;
+    }
+
+    /* Miss: pick a victim, pin it (keeping it valid so concurrent hits on
+       its old sector still read correct data during writeback), then do
+       writeback and the new-sector load under e->lock only. */
     index = cache_select_victim();
-    cache_evict(index);
     e = &cache.entries[index];
+    e->pin_count = 1;
     lock_acquire(&e->lock);
+    lock_release(&cache.lock);
+
+    if (e->dirty) {
+      block_sector_t old_sector = e->sector_num;
+      e->dirty = false;
+      block_write(fs_device, old_sector, e->data);
+    }
+
     e->sector_num = sector;
     e->valid = true;
     e->dirty = false;
     e->accessed = true;
-    e->pin_count = 1;
-    lock_release(&cache.lock);
     block_read(fs_device, sector, e->data);
     memcpy(buf, e->data + sector_ofs, chunk_size);
     lock_release(&e->lock);
+
+    /* Double-check: another thread may have installed SECTOR in a
+       different entry while we loaded.  If so, discard ours and retry. */
     lock_acquire(&cache.lock);
+    if (cache_lookup(sector) != index) {
+      e->valid = false;
+      e->pin_count--;
+      lock_release(&cache.lock);
+      continue;
+    }
     e->pin_count--;
     lock_release(&cache.lock);
-  } else {
-    e = &cache.entries[index];
-    e->pin_count++;
-    e->accessed = true;
-    lock_acquire(&e->lock);
-    lock_release(&cache.lock);
-    memcpy(buf, e->data + sector_ofs, chunk_size);
-    lock_release(&e->lock);
-    lock_acquire(&cache.lock);
-    e->pin_count--;
-    lock_release(&cache.lock);
+    return;
   }
 }
 
 /* Writes CHUNK_SIZE bytes from BUF starting at SECTOR_OFS within SECTOR,
-   through the buffer cache. Marks the cached block dirty. */
+   through the buffer cache.  Marks the cached block dirty.  Blocking I/O
+   is performed under the per-entry lock only, never under the global
+   cache lock. */
 static void cache_write(block_sector_t sector, const void* buf, int sector_ofs, int chunk_size) {
-  struct cache_entry* e;
+  while (true) {
+    struct cache_entry* e;
+    int index;
 
-  lock_acquire(&cache.lock);
-  int index = cache_lookup(sector);
-  if (index == -1) {
+    lock_acquire(&cache.lock);
+    index = cache_lookup(sector);
+    if (index != -1) {
+      e = &cache.entries[index];
+      e->pin_count++;
+      lock_acquire(&e->lock);
+      lock_release(&cache.lock);
+      if (e->valid && e->sector_num == sector) {
+        e->accessed = true;
+        memcpy(e->data + sector_ofs, buf, chunk_size);
+        e->dirty = true;
+        lock_release(&e->lock);
+        lock_acquire(&cache.lock);
+        e->pin_count--;
+        lock_release(&cache.lock);
+        return;
+      }
+      lock_release(&e->lock);
+      lock_acquire(&cache.lock);
+      e->pin_count--;
+      lock_release(&cache.lock);
+      continue;
+    }
+
     index = cache_select_victim();
-    cache_evict(index);
     e = &cache.entries[index];
+    e->pin_count = 1;
     lock_acquire(&e->lock);
+    lock_release(&cache.lock);
+
+    if (e->dirty) {
+      block_sector_t old_sector = e->sector_num;
+      e->dirty = false;
+      block_write(fs_device, old_sector, e->data);
+    }
+
     e->sector_num = sector;
     e->valid = true;
     e->dirty = false;
     e->accessed = true;
-    e->pin_count = 1;
-    lock_release(&cache.lock);
     if (!(sector_ofs == 0 && chunk_size == BLOCK_SECTOR_SIZE))
       block_read(fs_device, sector, e->data);
     memcpy(e->data + sector_ofs, buf, chunk_size);
-    lock_release(&e->lock);
-    lock_acquire(&cache.lock);
     e->dirty = true;
+    lock_release(&e->lock);
+
+    lock_acquire(&cache.lock);
+    if (cache_lookup(sector) != index) {
+      e->valid = false;
+      e->pin_count--;
+      lock_release(&cache.lock);
+      continue; /* retry hits the existing entry and re-applies the write */
+    }
     e->pin_count--;
     lock_release(&cache.lock);
-  } else {
-    e = &cache.entries[index];
-    e->pin_count++;
-    e->accessed = true;
-    lock_acquire(&e->lock);
-    lock_release(&cache.lock);
-    memcpy(e->data + sector_ofs, buf, chunk_size);
-    lock_release(&e->lock);
-    lock_acquire(&cache.lock);
-    e->dirty = true;
-    e->pin_count--;
-    lock_release(&cache.lock);
+    return;
   }
 }
 
@@ -639,3 +731,5 @@ bool inode_is_dir(struct inode* id) { return id != NULL && id->data.is_dir == 1;
 block_sector_t inode_get_parent(const struct inode* inode) { return inode->data.parent; }
 
 bool inode_is_removed(struct inode* id) { return id->removed; }
+
+struct lock* inode_get_lock(struct inode* inode) { return &inode->lock; }

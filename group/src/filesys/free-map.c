@@ -2,11 +2,13 @@
 #include "filesys/file.h"
 #include "filesys/filesys.h"
 #include "filesys/inode.h"
+#include "threads/synch.h"
 #include <bitmap.h>
 #include <debug.h>
 
 static struct file* free_map_file; /* Free map file. */
 static struct bitmap* free_map;    /* Free map, one bit per sector. */
+static struct lock free_map_lock;  /* Protects the free map bitmap. */
 
 /* Initializes the free map. */
 void free_map_init(void) {
@@ -15,6 +17,7 @@ void free_map_init(void) {
     PANIC("bitmap creation failed--file system device is too large");
   bitmap_mark(free_map, FREE_MAP_SECTOR);
   bitmap_mark(free_map, ROOT_DIR_SECTOR);
+  lock_init(&free_map_lock);
 }
 
 /* Allocates CNT consecutive sectors from the free map and stores
@@ -23,11 +26,14 @@ void free_map_init(void) {
    sectors were available or if the free_map file could not be
    written. */
 bool free_map_allocate(size_t cnt, block_sector_t* sectorp) {
-  block_sector_t sector = bitmap_scan_and_flip(free_map, 0, cnt, false);
+  block_sector_t sector;
+  lock_acquire(&free_map_lock);
+  sector = bitmap_scan_and_flip(free_map, 0, cnt, false);
   if (sector != BITMAP_ERROR && free_map_file != NULL && !bitmap_write(free_map, free_map_file)) {
     bitmap_set_multiple(free_map, sector, cnt, false);
     sector = BITMAP_ERROR;
   }
+  lock_release(&free_map_lock);
   if (sector != BITMAP_ERROR)
     *sectorp = sector;
   return sector != BITMAP_ERROR;
@@ -38,7 +44,10 @@ bool free_map_allocate(size_t cnt, block_sector_t* sectorp) {
    free_map_flush() after a batch of allocations.  Returns true on
    success, false if no sector is available. */
 bool free_map_allocate_one(block_sector_t* sectorp) {
-  block_sector_t sector = bitmap_scan_and_flip(free_map, 0, 1, false);
+  block_sector_t sector;
+  lock_acquire(&free_map_lock);
+  sector = bitmap_scan_and_flip(free_map, 0, 1, false);
+  lock_release(&free_map_lock);
   if (sector != BITMAP_ERROR)
     *sectorp = sector;
   return sector != BITMAP_ERROR;
@@ -46,20 +55,26 @@ bool free_map_allocate_one(block_sector_t* sectorp) {
 
 /* Makes CNT sectors starting at SECTOR available for use. */
 void free_map_release(block_sector_t sector, size_t cnt) {
+  lock_acquire(&free_map_lock);
   ASSERT(bitmap_all(free_map, sector, cnt));
   bitmap_set_multiple(free_map, sector, cnt, false);
   bitmap_write(free_map, free_map_file);
+  lock_release(&free_map_lock);
 }
 
 void free_map_release_one(block_sector_t sector) {
+  lock_acquire(&free_map_lock);
   ASSERT(bitmap_all(free_map, sector, 1));
   bitmap_set_multiple(free_map, sector, 1, false);
+  lock_release(&free_map_lock);
 }
 
 void free_map_flush(void) {
+  lock_acquire(&free_map_lock);
   if (free_map_file != NULL) {
     bitmap_write(free_map, free_map_file);
   }
+  lock_release(&free_map_lock);
 }
 
 /* Opens the free map file and reads it from disk. */

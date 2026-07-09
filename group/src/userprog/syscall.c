@@ -22,11 +22,8 @@ static void check_valid_bytes(const void* vaddr, size_t size);
 static size_t safe_strlen(const void* vaddr);
 void exit_process(int status);
 
-static struct lock filesys_lock;
-
 void syscall_init(void) {
   intr_register_int(0x30, 3, INTR_ON, syscall_handler, "syscall");
-  lock_init(&filesys_lock);
 }
 
 void exit_process(int status) {
@@ -182,21 +179,14 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
       putbuf(buffer, size);
       f->eax = size;
     } else {
-      lock_acquire(&filesys_lock);
       struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
       if (file_ptr == NULL) {
-        lock_release(&filesys_lock);
+        f->eax = -1;
+      } else if (inode_is_dir(file_get_inode(file_ptr))) {
         f->eax = -1;
       } else {
-        if (inode_is_dir(file_get_inode(file_ptr))) {
-          lock_release(&filesys_lock);
-          f->eax = -1;
-        } else {
-          check_valid_bytes(buffer, size);
-          int n = file_write(file_ptr, buffer, size);
-          lock_release(&filesys_lock);
-          f->eax = n;
-        }
+        check_valid_bytes(buffer, size);
+        f->eax = file_write(file_ptr, buffer, size);
       }
     }
   } else if (args[0] == SYS_PRACTICE) {
@@ -249,42 +239,30 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
     const char* file = (const char*)args[1];
     unsigned initial_size = (unsigned)args[2];
     check_valid_bytes(file, safe_strlen(file) + 1);
-    lock_acquire(&filesys_lock);
     f->eax = filesys_create(file, initial_size);
-    lock_release(&filesys_lock);
   } else if (args[0] == SYS_REMOVE) {
     check_valid_bytes(args, 2 * sizeof(uint32_t));
     const char* file = (const char*)args[1];
     check_valid_bytes(file, safe_strlen(file) + 1);
-    lock_acquire(&filesys_lock);
     f->eax = filesys_remove(file);
-    lock_release(&filesys_lock);
   } else if (args[0] == SYS_OPEN) {
     check_valid_bytes(args, 2 * sizeof(uint32_t));
     const char* file = (const char*)args[1];
     check_valid_bytes(file, safe_strlen(file) + 1);
-    lock_acquire(&filesys_lock);
     struct file* file_ptr = filesys_open(file);
     if (file_ptr == NULL) {
-      lock_release(&filesys_lock);
       f->eax = -1;
     } else {
-      int result = store_fd(thread_current()->pcb, file_ptr, -1);
-      lock_release(&filesys_lock);
-      f->eax = result;
+      f->eax = store_fd(thread_current()->pcb, file_ptr, -1);
     }
   } else if (args[0] == SYS_FILESIZE) {
     check_valid_bytes(args, 2 * sizeof(uint32_t));
     int fd = (int)args[1];
-    lock_acquire(&filesys_lock);
     struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
     if (file_ptr == NULL) {
-      lock_release(&filesys_lock);
       f->eax = -1;
     } else {
-      off_t sz = file_length(file_ptr);
-      lock_release(&filesys_lock);
-      f->eax = sz;
+      f->eax = file_length(file_ptr);
     }
   } else if (args[0] == SYS_READ) {
     check_valid_bytes(args, 4 * sizeof(uint32_t));
@@ -292,49 +270,35 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
     void* buffer = (void*)args[2];
     unsigned size = (unsigned)args[3];
     check_valid_bytes(buffer, size);
-    lock_acquire(&filesys_lock);
     struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
     if (file_ptr == NULL) {
-      lock_release(&filesys_lock);
+      f->eax = -1;
+    } else if (inode_is_dir(file_get_inode(file_ptr))) {
       f->eax = -1;
     } else {
-      if (inode_is_dir(file_get_inode(file_ptr))) {
-        lock_release(&filesys_lock);
-        f->eax = -1;
-      } else {
-        int n = file_read(file_ptr, buffer, size);
-        lock_release(&filesys_lock);
-        f->eax = n;
-      }
+      f->eax = file_read(file_ptr, buffer, size);
     }
   } else if (args[0] == SYS_SEEK) {
     check_valid_bytes(args, 3 * sizeof(uint32_t));
     int fd = (int)args[1];
     unsigned position = (unsigned)args[2];
-    lock_acquire(&filesys_lock);
     struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
     if (file_ptr != NULL) {
       file_seek(file_ptr, position);
     }
-    lock_release(&filesys_lock);
   } else if (args[0] == SYS_TELL) {
     check_valid_bytes(args, 2 * sizeof(uint32_t));
     int fd = (int)args[1];
-    lock_acquire(&filesys_lock);
     struct file* file_ptr = (struct file*)get_kernel_fd(thread_current()->pcb, fd);
     if (file_ptr == NULL) {
-      lock_release(&filesys_lock);
       f->eax = -1;
     } else {
-      off_t pos = file_tell(file_ptr);
-      lock_release(&filesys_lock);
-      f->eax = pos;
+      f->eax = file_tell(file_ptr);
     }
   } else if (args[0] == SYS_CLOSE) {
     check_valid_bytes(args, 2 * sizeof(uint32_t));
     int fd = (int)args[1];
     struct process* pcb = thread_current()->pcb;
-    lock_acquire(&filesys_lock);
     struct file* file_ptr = (struct file*)get_kernel_fd(pcb, fd);
     /* Skip file_close for inherited fds to avoid double-close on shared struct file */
     if (file_ptr != NULL) {
@@ -344,39 +308,30 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
         file_close(file_ptr);
     }
     remove_fd(pcb, fd);
-    lock_release(&filesys_lock);
   } else if (args[0] == SYS_INUMBER) {
     check_valid_bytes(args, 2 * sizeof(uint32_t));
     int fd = (int)args[1];
-    lock_acquire(&filesys_lock);
     struct file* file = get_kernel_fd(thread_current()->pcb, fd);
     if (file == NULL) {
       f->eax = -1;
     } else {
       f->eax = inode_get_inumber(file_get_inode(file));
     }
-    lock_release(&filesys_lock);
   } else if (args[0] == SYS_CHDIR) {
     check_valid_bytes(args, 2 * sizeof(uint32_t));
     const char* path = (const char*)args[1];
     check_valid_bytes(path, safe_strlen(path) + 1);
-    lock_acquire(&filesys_lock);
     f->eax = syscall_chdir(path);
-    lock_release(&filesys_lock);
   } else if (args[0] == SYS_MKDIR) {
     check_valid_bytes(args, 2 * sizeof(uint32_t));
     const char* path = (const char*)args[1];
     check_valid_bytes(path, safe_strlen(path) + 1);
-    lock_acquire(&filesys_lock);
     f->eax = syscall_mkdir(path);
-    lock_release(&filesys_lock);
   } else if (args[0] == SYS_READDIR) {
     check_valid_bytes(args, 3 * sizeof(uint32_t));
     char* name = (char*)args[2];
     check_valid_bytes(name, NAME_MAX + 1);
-    lock_acquire(&filesys_lock);
     f->eax = syscall_readdir((int)args[1], name);
-    lock_release(&filesys_lock);
   } else if (args[0] == SYS_ISDIR) {
     check_valid_bytes(args, 2 * sizeof(uint32_t));
     f->eax = syscall_isdir((int)args[1]);
