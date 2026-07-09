@@ -20,7 +20,7 @@ typedef void (*stub_fun)(pthread_fun, void*);
 
 struct fd_table {
   struct file* entries[128];
-  bool inherited[128];     /* true if fd was inherited from parent via fork */
+  bool inherited[128]; /* true if fd was inherited from parent via fork */
   int next_fd;
 };
 

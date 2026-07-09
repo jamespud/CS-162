@@ -1,5 +1,6 @@
 #include "userprog/syscall.h"
 #include "devices/shutdown.h"
+#include "filesys/directory.h"
 #include "filesys/file.h"
 #include "filesys/filesys.h"
 #include "filesys/inode.h"
@@ -12,6 +13,7 @@
 #include "userprog/process.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <syscall-nr.h>
 
 static void syscall_handler(struct intr_frame*);
@@ -78,6 +80,80 @@ static size_t safe_strlen(const void* vaddr) {
   }
 }
 
+static bool syscall_chdir(const char* dir) {
+  char target_name[NAME_MAX + 1];
+  struct dir* parent = path_lookup(dir, target_name);
+  if (parent == NULL)
+    return false;
+
+  struct inode* target_inode = NULL;
+
+  if (strlen(target_name) == 0) {
+    target_inode = inode_reopen(dir_get_inode(parent));
+  } else {
+    dir_lookup(parent, target_name, &target_inode);
+  }
+
+  if (target_inode == NULL || !inode_is_dir(target_inode)) {
+    inode_close(target_inode);
+    dir_close(parent);
+    return false;
+  }
+
+  dir_close(thread_current()->cwd);
+  thread_current()->cwd = dir_open(target_inode);
+
+  dir_close(parent);
+  return true;
+}
+
+static bool syscall_mkdir(const char* dir) {
+  char target_name[NAME_MAX + 1];
+  struct dir* parent = path_lookup(dir, target_name);
+  if (parent == NULL || strlen(target_name) == 0) {
+    dir_close(parent);
+    return false;
+  }
+
+  bool success = dir_create_subdirectory(parent, target_name);
+
+  dir_close(parent);
+  return success;
+}
+
+static bool syscall_readdir(int fd, char* name) {
+  struct thread* t = thread_current();
+  if (fd < 0 || fd >= 128) {
+    return false;
+  }
+  if (t->pcb->fd_table == NULL)
+    return false;
+  struct file* f = t->pcb->fd_table->entries[fd];
+  if (f == NULL) {
+    return false;
+  }
+
+  if (!inode_is_dir(file_get_inode(f))) {
+    return false;
+  }
+
+  off_t pos = file_tell(f);
+  bool ok = dir_readdir_at(file_get_inode(f), &pos, name);
+  file_seek(f, pos);
+  return ok;
+}
+
+static bool syscall_isdir(int fd) {
+  struct thread* t = thread_current();
+  if (fd < 0 || fd >= 128) {
+    return false;
+  }
+  if (t->pcb->fd_table == NULL)
+    return false;
+  struct file* f = t->pcb->fd_table->entries[fd];
+  return inode_is_dir(file_get_inode(f));
+}
+
 static void syscall_handler(struct intr_frame* f UNUSED) {
   check_valid_bytes(f->esp, sizeof(uint32_t));
   uint32_t* args = ((uint32_t*)f->esp);
@@ -112,10 +188,15 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
         lock_release(&filesys_lock);
         f->eax = -1;
       } else {
-        check_valid_bytes(buffer, size);
-        int n = file_write(file_ptr, buffer, size);
-        lock_release(&filesys_lock);
-        f->eax = n;
+        if (inode_is_dir(file_get_inode(file_ptr))) {
+          lock_release(&filesys_lock);
+          f->eax = -1;
+        } else {
+          check_valid_bytes(buffer, size);
+          int n = file_write(file_ptr, buffer, size);
+          lock_release(&filesys_lock);
+          f->eax = n;
+        }
       }
     }
   } else if (args[0] == SYS_PRACTICE) {
@@ -217,9 +298,14 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
       lock_release(&filesys_lock);
       f->eax = -1;
     } else {
-      int n = file_read(file_ptr, buffer, size);
-      lock_release(&filesys_lock);
-      f->eax = n;
+      if (inode_is_dir(file_get_inode(file_ptr))) {
+        lock_release(&filesys_lock);
+        f->eax = -1;
+      } else {
+        int n = file_read(file_ptr, buffer, size);
+        lock_release(&filesys_lock);
+        f->eax = n;
+      }
     }
   } else if (args[0] == SYS_SEEK) {
     check_valid_bytes(args, 3 * sizeof(uint32_t));
@@ -270,5 +356,29 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
       f->eax = inode_get_inumber(file_get_inode(file));
     }
     lock_release(&filesys_lock);
+  } else if (args[0] == SYS_CHDIR) {
+    check_valid_bytes(args, 2 * sizeof(uint32_t));
+    const char* path = (const char*)args[1];
+    check_valid_bytes(path, safe_strlen(path) + 1);
+    lock_acquire(&filesys_lock);
+    f->eax = syscall_chdir(path);
+    lock_release(&filesys_lock);
+  } else if (args[0] == SYS_MKDIR) {
+    check_valid_bytes(args, 2 * sizeof(uint32_t));
+    const char* path = (const char*)args[1];
+    check_valid_bytes(path, safe_strlen(path) + 1);
+    lock_acquire(&filesys_lock);
+    f->eax = syscall_mkdir(path);
+    lock_release(&filesys_lock);
+  } else if (args[0] == SYS_READDIR) {
+    check_valid_bytes(args, 3 * sizeof(uint32_t));
+    char* name = (char*)args[2];
+    check_valid_bytes(name, NAME_MAX + 1);
+    lock_acquire(&filesys_lock);
+    f->eax = syscall_readdir((int)args[1], name);
+    lock_release(&filesys_lock);
+  } else if (args[0] == SYS_ISDIR) {
+    check_valid_bytes(args, 2 * sizeof(uint32_t));
+    f->eax = syscall_isdir((int)args[1]);
   }
 }

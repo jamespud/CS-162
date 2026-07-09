@@ -13,7 +13,7 @@
 
 #define BUFFER_SIZE 64
 
-#define DIRECT_PTRS 124
+#define DIRECT_PTRS 122
 #define INDIR_PTRS (BLOCK_SECTOR_SIZE / sizeof(block_sector_t))              /* 128 */
 #define DBL_RANGE (DIRECT_PTRS + INDIR_PTRS)                                 /* 252 */
 #define MAX_FILE_BLOCKS (DIRECT_PTRS + INDIR_PTRS + INDIR_PTRS * INDIR_PTRS) /* 16636 */
@@ -23,9 +23,11 @@
 struct inode_disk {
   off_t length;                       /* File size in bytes. */
   unsigned magic;                     /* Magic number. */
-  block_sector_t direct[DIRECT_PTRS]; /* 496 */
+  block_sector_t direct[DIRECT_PTRS]; /* 488 */
   block_sector_t indirect;            /* 4 */
   block_sector_t doubly_indirect;     /* 4 */
+  block_sector_t parent;
+  uint32_t is_dir;
 };
 
 /* Returns the number of sectors to allocate for an inode SIZE
@@ -255,7 +257,7 @@ static void index_free_all(const struct inode_disk* id) {
    device.
    Returns true if successful.
    Returns false if memory or disk allocation fails. */
-bool inode_create(block_sector_t sector, off_t length) {
+bool inode_create(block_sector_t sector, off_t length, bool is_dir, block_sector_t parent) {
   struct inode_disk* disk_inode;
   bool success = true;
 
@@ -271,6 +273,8 @@ bool inode_create(block_sector_t sector, off_t length) {
 
   disk_inode->length = length;
   disk_inode->magic = INODE_MAGIC;
+  disk_inode->is_dir = is_dir;
+  disk_inode->parent = parent;
 
   size_t sectors = bytes_to_sectors(length);
   for (size_t i = 0; i < sectors; i++) {
@@ -629,3 +633,9 @@ static void cache_write(block_sector_t sector, const void* buf, int sector_ofs, 
     lock_release(&cache.lock);
   }
 }
+
+bool inode_is_dir(struct inode* id) { return id != NULL && id->data.is_dir == 1; }
+
+block_sector_t inode_get_parent(const struct inode* inode) { return inode->data.parent; }
+
+bool inode_is_removed(struct inode* id) { return id->removed; }

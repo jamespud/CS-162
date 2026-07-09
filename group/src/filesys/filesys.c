@@ -41,9 +41,20 @@ void filesys_done(void) {
    or if internal memory allocation fails. */
 bool filesys_create(const char* name, off_t initial_size) {
   block_sector_t inode_sector = 0;
-  struct dir* dir = dir_open_root();
+  char tail_name[NAME_MAX + 1];
+  struct dir* dir = path_lookup(name, tail_name);
+
+  if (dir == NULL)
+    return false;
+
+  if (strcmp(tail_name, "") == 0 || strcmp(tail_name, ".") == 0) {
+    dir_close(dir);
+    return false;
+  }
+
   bool success = (dir != NULL && free_map_allocate(1, &inode_sector) &&
-                  inode_create(inode_sector, initial_size) && dir_add(dir, name, inode_sector));
+                  inode_create(inode_sector, initial_size, false, 0) &&
+                  dir_add(dir, tail_name, inode_sector));
   if (!success && inode_sector != 0)
     free_map_release(inode_sector, 1);
   dir_close(dir);
@@ -57,11 +68,21 @@ bool filesys_create(const char* name, off_t initial_size) {
    Fails if no file named NAME exists,
    or if an internal memory allocation fails. */
 struct file* filesys_open(const char* name) {
-  struct dir* dir = dir_open_root();
+  char tail_name[NAME_MAX + 1];
+  struct dir* dir = path_lookup(name, tail_name);
   struct inode* inode = NULL;
 
+  if (dir == NULL)
+    return NULL;
+
+  if (strcmp(tail_name, "") == 0 || strcmp(tail_name, ".") == 0) {
+    struct inode* inode = inode_reopen(dir_get_inode(dir));
+    dir_close(dir);
+    return file_open(inode);
+  }
+
   if (dir != NULL)
-    dir_lookup(dir, name, &inode);
+    dir_lookup(dir, tail_name, &inode);
   dir_close(dir);
 
   return file_open(inode);
@@ -72,8 +93,17 @@ struct file* filesys_open(const char* name) {
    Fails if no file named NAME exists,
    or if an internal memory allocation fails. */
 bool filesys_remove(const char* name) {
-  struct dir* dir = dir_open_root();
-  bool success = dir != NULL && dir_remove(dir, name);
+  char tail_name[NAME_MAX + 1];
+  struct dir* dir = path_lookup(name, tail_name);
+
+  if (dir == NULL)
+    return false;
+
+  if (strcmp(tail_name, "") == 0 || strcmp(tail_name, ".") == 0) {
+    dir_close(dir);
+    return false;
+  }
+  bool success = dir != NULL && dir_remove(dir, tail_name);
   dir_close(dir);
 
   return success;

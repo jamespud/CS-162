@@ -29,6 +29,7 @@ bool setup_thread(void (**eip)(void), void** esp);
 struct exec_args {
   char* file_name;
   struct child_status* my_status;
+  struct dir* cwd;
 };
 
 struct fork_args {
@@ -37,6 +38,7 @@ struct fork_args {
   struct child_status* my_status; // 指向父进程 children 列表中的条目
   struct fd_table* fd_table;      // 文件描述符表
   struct file* parent_exec_file;  // 父进程的可执行文件句柄
+  struct dir* cwd;
 };
 
 /* Initializes user programs in the system by ensuring the main
@@ -111,6 +113,7 @@ pid_t process_execute(const char* file_name) {
 
   args->file_name = fn_copy;
   args->my_status = my_status;
+  args->cwd = thread_current()->cwd;
 
   list_push_back(&thread_current()->pcb->children, &my_status->elem);
 
@@ -151,6 +154,7 @@ static void start_process(void* args_) {
 
     t->pcb->my_status = my_status;
     list_init(&new_pcb->children);
+    t->cwd = args->cwd ? dir_reopen(args->cwd) : dir_open_root();
 
     // Continue initializing the PCB as normal
     t->pcb->main_thread = t;
@@ -348,6 +352,8 @@ pid_t process_fork(struct intr_frame* f) {
     return TID_ERROR;
   }
 
+  char tail_name[NAME_MAX + 1];
+  fargs->cwd = cur->cwd;
   fargs->parent_frame = *f; // 拷贝整个 intr_frame！（不是存指针）
   fargs->child_pagedir = child_pd;
   fargs->my_status = my_status;
@@ -411,6 +417,7 @@ static void start_fork(void* args_) {
   else
     new_pcb->exec_file = NULL;
 
+  t->cwd = fargs->cwd ? dir_reopen(fargs->cwd) : dir_open_root();
   t->pcb = new_pcb;
   t->pcb->my_status = fargs->my_status;
   strlcpy(t->pcb->process_name, thread_current()->name, sizeof t->pcb->process_name);
@@ -484,13 +491,15 @@ void process_exit(void) {
 
   if (cur->pcb->fd_table != NULL) {
     for (int i = 0; i < 128; i++) {
-      if (cur->pcb->fd_table->entries[i] != NULL
-          && !cur->pcb->fd_table->inherited[i]) {
+      if (cur->pcb->fd_table->entries[i] != NULL && !cur->pcb->fd_table->inherited[i]) {
         file_close(cur->pcb->fd_table->entries[i]);
       }
     }
     free(cur->pcb->fd_table);
   }
+
+  dir_close(cur->cwd);
+  cur->cwd = NULL;
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
