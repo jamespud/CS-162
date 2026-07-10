@@ -1,4 +1,5 @@
 #include "userprog/syscall.h"
+#include "devices/block.h"
 #include "devices/shutdown.h"
 #include "filesys/directory.h"
 #include "filesys/file.h"
@@ -22,9 +23,7 @@ static void check_valid_bytes(const void* vaddr, size_t size);
 static size_t safe_strlen(const void* vaddr);
 void exit_process(int status);
 
-void syscall_init(void) {
-  intr_register_int(0x30, 3, INTR_ON, syscall_handler, "syscall");
-}
+void syscall_init(void) { intr_register_int(0x30, 3, INTR_ON, syscall_handler, "syscall"); }
 
 void exit_process(int status) {
   struct process* pcb = thread_current()->pcb;
@@ -335,5 +334,14 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
   } else if (args[0] == SYS_ISDIR) {
     check_valid_bytes(args, 2 * sizeof(uint32_t));
     f->eax = syscall_isdir((int)args[1]);
+  } else if (args[0] == SYS_CACHE_FLUSH) {
+    check_valid_bytes(args, 1 * sizeof(uint32_t));
+    cache_flush_all();
+  } else if (args[0] == SYS_BLOCK_READ_CNT) {
+    check_valid_bytes(args, 1 * sizeof(uint32_t));
+    f->eax = block_read_count(block_get_role(BLOCK_FILESYS));
+  } else if (args[0] == SYS_BLOCK_WRITE_CNT) {
+    check_valid_bytes(args, 1 * sizeof(uint32_t));
+    f->eax = block_write_count(block_get_role(BLOCK_FILESYS));
   }
 }

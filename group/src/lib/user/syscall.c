@@ -1,6 +1,6 @@
-#include <syscall.h>
 #include "../syscall-nr.h"
 #include <pthread.h>
+#include <syscall.h>
 
 /* Invokes syscall NUMBER, passing no arguments, and returns the
    return value as an `int'. */
@@ -115,6 +115,16 @@ bool readdir(int fd, char name[READDIR_MAX_LEN + 1]) { return syscall2(SYS_READD
 bool isdir(int fd) { return syscall1(SYS_ISDIR, fd); }
 
 int inumber(int fd) { return syscall1(SYS_INUMBER, fd); }
+
+void cache_flush_all() { return syscall0(SYS_CACHE_FLUSH); }
+
+int block_read_count(void) {
+  return syscall0(SYS_BLOCK_READ_CNT);
+}
+
+int block_write_count(void) {
+  return syscall0(SYS_BLOCK_WRITE_CNT);
+}
 
 tid_t sys_pthread_create(stub_fun sfun, pthread_fun tfun, const void* arg) {
   return syscall3(SYS_PT_CREATE, sfun, tfun, arg);

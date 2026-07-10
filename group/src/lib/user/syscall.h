@@ -1,14 +1,14 @@
 #ifndef __LIB_USER_SYSCALL_H
 #define __LIB_USER_SYSCALL_H
 
-#include <stdbool.h>
 #include <debug.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdlib.h>
 
 /* Process identifier. */
 typedef int pid_t;
-#define PID_ERROR ((pid_t)-1)
+#define PID_ERROR ((pid_t) - 1)
 
 /* Synchronization Types */
 typedef char lock_t;
@@ -16,7 +16,7 @@ typedef char sema_t;
 
 /* Map region identifier. */
 typedef int mapid_t;
-#define MAP_FAILED ((mapid_t)-1)
+#define MAP_FAILED ((mapid_t) - 1)
 
 /* Maximum characters in a filename written by readdir(). */
 #define READDIR_MAX_LEN 14
@@ -62,6 +62,10 @@ bool mkdir(const char* dir);
 bool readdir(int fd, char name[READDIR_MAX_LEN + 1]);
 bool isdir(int fd);
 int inumber(int fd);
+
+void cache_flush_all();
+int block_read_count(void);
+int block_write_count(void);
 
 pid_t fork(void);
 

@@ -1,8 +1,8 @@
 #ifndef DEVICES_BLOCK_H
 #define DEVICES_BLOCK_H
 
-#include <stddef.h>
 #include <inttypes.h>
+#include <stddef.h>
 
 /* Size of a block device sector in bytes.
    All IDE disks use this sector size, as do most USB and SCSI
@@ -67,5 +67,8 @@ struct block_operations {
 
 struct block* block_register(const char* name, enum block_type, const char* extra_info,
                              block_sector_t size, const struct block_operations*, void* aux);
+
+uint64_t block_read_count(struct block*);
+uint64_t block_write_count(struct block*);
 
 #endif /* devices/block.h */
