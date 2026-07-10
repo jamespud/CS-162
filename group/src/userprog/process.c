@@ -36,7 +36,7 @@ struct fork_args {
   struct intr_frame parent_frame; // 复制父进程的寄存器状态（必须传值！）
   uint32_t* child_pagedir;        // 子进程的新页目录
   struct child_status* my_status; // 指向父进程 children 列表中的条目
-  struct fd_table* fd_table;      // 文件描述符表
+  struct fd_table fd_table;       // fork时快照的文件描述符表
   struct file* parent_exec_file;  // 父进程的可执行文件句柄
   struct dir* cwd;
 };
@@ -357,7 +357,7 @@ pid_t process_fork(struct intr_frame* f) {
   fargs->parent_frame = *f; // 拷贝整个 intr_frame！（不是存指针）
   fargs->child_pagedir = child_pd;
   fargs->my_status = my_status;
-  fargs->fd_table = cur->pcb->fd_table; // 共享父进程的文件描述符表
+  memcpy(&fargs->fd_table, cur->pcb->fd_table, sizeof(struct fd_table)); // 快照父进程 fd 表
   fargs->parent_exec_file = cur->pcb->exec_file;
 
   /* 5. 创建子线程 */
@@ -400,7 +400,7 @@ static void start_fork(void* args_) {
   /* Copy parent's fd_table: same struct file pointers (shared positions) */
   struct fd_table* child_fd = malloc(sizeof(struct fd_table));
   if (child_fd != NULL) {
-    memcpy(child_fd, fargs->fd_table, sizeof(struct fd_table));
+    memcpy(child_fd, &fargs->fd_table, sizeof(struct fd_table));
     for (int i = 0; i < 128; i++)
       if (child_fd->entries[i] != NULL)
         child_fd->inherited[i] = true;
